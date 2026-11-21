@@ -22,8 +22,8 @@ use crate::domain::model::{
 use crate::domain::protocol::{TcpPayload, UdpPayload};
 use crate::domain::session_log::SessionLog;
 use crate::domain::validation::{
-    validate_and_normalize_display_name, validate_chat_body, validate_manual_peer_endpoint,
-    validate_password, validate_port, validate_received_chat_body,
+    validate_and_normalize_display_name, validate_chat_body, validate_identifier,
+    validate_manual_peer_endpoint, validate_password, validate_port, validate_received_chat_body,
 };
 use crate::network::nic::{NicInfo, resolve_active_nic_from_str};
 use crate::network::rate_limit::{AnomalyRateLimiter, UdpIpRateLimiter};
@@ -33,7 +33,7 @@ use crate::network::tcp_transport::{
 };
 use crate::network::udp_discovery::{
     DEFAULT_BEACON_INTERVAL, DEFAULT_NIC_REFRESH_INTERVAL, DEFAULT_PEER_TIMEOUT_SECS,
-    UdpProcessOutcome, bind_udp_socket, process_udp_datagram, send_encrypted_beacon,
+    UdpProcessOutcome, bind_udp_socket, normalize_ip, process_udp_datagram, send_encrypted_beacon,
     send_encrypted_bye_twice,
 };
 use crate::network::{AnomalyEvent, current_unix_timestamp};
@@ -45,6 +45,67 @@ const HELLO_REPLY_COOLDOWN: Duration = Duration::from_secs(5);
 const PEER_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const COMMAND_CHANNEL_CAPACITY: usize = 128;
 const INTERNAL_CHANNEL_CAPACITY: usize = 256;
+const MAX_PEER_SEQ_TRACKED: usize = 512;
+const PEER_SEQ_TTL_SECS: i64 = DEFAULT_TIMESTAMP_WINDOW_SECS * 2;
+
+struct PeerSeqTracker {
+    entries: HashMap<String, (u64, i64)>,
+}
+
+impl PeerSeqTracker {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn check_and_record(&mut self, peer_id: &str, seq: u64, now_unix: i64) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        if let Some(&(last_seq, _)) = self.entries.get(peer_id)
+            && seq <= last_seq
+        {
+            return false;
+        }
+        if !self.entries.contains_key(peer_id) && self.entries.len() >= MAX_PEER_SEQ_TRACKED {
+            let mut removed_keys = Vec::new();
+            for (k, &(_, ts)) in &self.entries {
+                if now_unix.saturating_sub(ts).abs() > PEER_SEQ_TTL_SECS {
+                    removed_keys.push(k.clone());
+                }
+            }
+            for mut k in removed_keys {
+                self.entries.remove(&k);
+                k.zeroize();
+            }
+            if self.entries.len() >= MAX_PEER_SEQ_TRACKED
+                && let Some(mut oldest_key) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest_key);
+                oldest_key.zeroize();
+            }
+        }
+        self.entries.insert(peer_id.to_string(), (seq, now_unix));
+        true
+    }
+
+    fn clear(&mut self) {
+        for (mut key, _) in self.entries.drain() {
+            key.zeroize();
+        }
+    }
+}
+
+impl Drop for PeerSeqTracker {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 
 #[derive(Clone)]
 pub struct SessionLogReader {
@@ -177,6 +238,10 @@ struct ActiveSession {
     udp_target: Option<SocketAddr>,
     peers: PeerRegistry,
     replay: ReplayCache,
+    next_udp_seq: u64,
+    next_hello_seq: u64,
+    udp_seq_tracker: PeerSeqTracker,
+    hello_seq_tracker: PeerSeqTracker,
     recent_hello_sent: HashMap<SocketAddr, Instant>,
     recent_peer_hello_sent: HashMap<String, Instant>,
     manual_pending_endpoints: HashMap<SocketAddr, String>,
@@ -188,12 +253,48 @@ struct ActiveSession {
 }
 
 impl ActiveSession {
+    fn next_udp_seq(&mut self) -> u64 {
+        let s = self.next_udp_seq.max(1);
+        self.next_udp_seq = s.saturating_add(1);
+        s
+    }
+
+    fn next_hello_seq(&mut self) -> u64 {
+        let s = self.next_hello_seq.max(1);
+        self.next_hello_seq = s.saturating_add(1);
+        s
+    }
+
+    fn advertised_ip_for_target(&self, target: Option<IpAddr>) -> Option<IpAddr> {
+        let base = if let Some(t) = target
+            && t.is_loopback()
+        {
+            Some(t)
+        } else if !self.bind_ip.is_unspecified() {
+            Some(self.bind_ip)
+        } else {
+            self.nic_info.as_ref().map(|nic| IpAddr::V4(nic.ip))
+        };
+        match (base, target) {
+            (Some(b), Some(t)) if b.is_ipv4() != t.is_ipv4() => None,
+            (b, _) => b,
+        }
+    }
+
     fn wipe_in_memory(&mut self) {
         self.display_name.zeroize();
         self.ephemeral_peer_id.zeroize();
         self.peers.clear_all();
         self.replay.clear();
+        self.udp_seq_tracker.clear();
+        self.hello_seq_tracker.clear();
         self.keys.zeroize_now();
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.wipe_in_memory();
     }
 }
 
@@ -623,7 +724,24 @@ impl Coordinator {
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Err(err) => {
+                                if udp_cancel.is_cancelled() {
+                                    break;
+                                }
+                                if matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::Interrupted
+                                        | std::io::ErrorKind::WouldBlock
+                                ) {
+                                    continue;
+                                }
+                                tokio::select! {
+                                    _ = udp_cancel.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
+                                }
+                            }
                         }
                     }
                 }
@@ -676,6 +794,10 @@ impl Coordinator {
             udp_target,
             peers: PeerRegistry::new(),
             replay: ReplayCache::new(),
+            next_udp_seq: 1,
+            next_hello_seq: 1,
+            udp_seq_tracker: PeerSeqTracker::new(),
+            hello_seq_tracker: PeerSeqTracker::new(),
             recent_hello_sent: HashMap::new(),
             recent_peer_hello_sent: HashMap::new(),
             manual_pending_endpoints: HashMap::new(),
@@ -719,6 +841,8 @@ impl Coordinator {
         let Ok(beacon_key) = active.keys.with_beacon_key(|k| Zeroizing::new(*k)) else {
             return;
         };
+        let seq = active.next_udp_seq();
+        let advertised_ip = active.advertised_ip_for_target(Some(target.ip()));
         let sock = Arc::clone(&active.udp_socket);
         let payload = UdpPayload::Beacon {
             peer_id: active.ephemeral_peer_id.clone(),
@@ -726,6 +850,8 @@ impl Coordinator {
             tcp_port: active.tcp_port,
             status: active.status,
             timestamp: current_unix_timestamp(),
+            seq,
+            advertised_ip,
         };
         let cancel = active.cancel.clone();
         active.outbound_tasks.spawn(async move {
@@ -899,6 +1025,7 @@ impl Coordinator {
             )
         };
 
+        let now_unix = current_unix_timestamp();
         match outcome {
             UdpProcessOutcome::Beacon {
                 peer_ip,
@@ -906,10 +1033,17 @@ impl Coordinator {
                 display_name,
                 tcp_port,
                 status,
+                seq,
                 ..
             } => {
                 let mut events = Vec::new();
                 if let Some(active) = &mut self.active {
+                    if !active
+                        .udp_seq_tracker
+                        .check_and_record(&peer_id, seq, now_unix)
+                    {
+                        return;
+                    }
                     let was_online = active.peers.get(&peer_id).is_some_and(|p| p.is_online);
                     let existing_origin = active.peers.get(&peer_id).map(|p| p.origin);
                     let info = PeerInfo {
@@ -920,7 +1054,7 @@ impl Coordinator {
                         status,
                         is_online: true,
                         origin: existing_origin.unwrap_or(PeerOrigin::Discovered),
-                        last_seen_unix: current_unix_timestamp(),
+                        last_seen_unix: now_unix,
                         unread_count: 0,
                     };
                     let res = {
@@ -949,7 +1083,14 @@ impl Coordinator {
                     self.emit(ev);
                 }
             }
-            UdpProcessOutcome::Bye { peer_id, .. } => {
+            UdpProcessOutcome::Bye { peer_id, seq, .. } => {
+                if let Some(active) = &mut self.active
+                    && !active
+                        .udp_seq_tracker
+                        .check_and_record(&peer_id, seq, now_unix)
+                {
+                    return;
+                }
                 self.mark_peer_offline_and_emit(&peer_id);
             }
             UdpProcessOutcome::Anomaly(anom) => {
@@ -1036,7 +1177,21 @@ impl Coordinator {
                 tcp_port,
                 status,
                 timestamp,
+                seq,
+                advertised_ip,
             } => {
+                if validate_identifier(sender_id).is_err()
+                    || validate_port(*tcp_port).is_err()
+                    || *seq == 0
+                {
+                    return;
+                }
+                if let Some(adv) = advertised_ip
+                    && !adv.is_unspecified()
+                    && normalize_ip(*adv) != normalize_ip(msg.peer_ip)
+                {
+                    return;
+                }
                 if let Err(skew_seconds) =
                     check_timestamp_window(*timestamp, now_unix, DEFAULT_TIMESTAMP_WINDOW_SECS)
                 {
@@ -1051,15 +1206,19 @@ impl Coordinator {
                 let Ok(clean_name) = validate_and_normalize_display_name(sender_name) else {
                     return;
                 };
-                if validate_port(*tcp_port).is_err() || sender_id.trim().is_empty() {
-                    return;
-                }
 
                 let tcp_port = *tcp_port;
                 let status = *status;
+                let seq = *seq;
                 let mut events = Vec::new();
                 if let Some(active) = &mut self.active {
                     if sender_id == &active.ephemeral_peer_id {
+                        return;
+                    }
+                    if !active
+                        .hello_seq_tracker
+                        .check_and_record(sender_id, seq, now_unix)
+                    {
                         return;
                     }
                     let remote_addr = SocketAddr::new(msg.peer_ip, tcp_port);
@@ -1074,6 +1233,12 @@ impl Coordinator {
                                 .map(|_| default_temp_id.clone())
                         });
 
+                    let existing_origin = active.peers.get(sender_id).map(|p| p.origin);
+                    let origin = if temp_id.is_some() {
+                        PeerOrigin::Manual
+                    } else {
+                        existing_origin.unwrap_or(PeerOrigin::Discovered)
+                    };
                     let was_online = active.peers.get(sender_id).is_some_and(|p| p.is_online);
                     let formal = PeerInfo {
                         peer_id: sender_id.clone(),
@@ -1082,7 +1247,7 @@ impl Coordinator {
                         tcp_port,
                         status,
                         is_online: true,
-                        origin: PeerOrigin::Manual,
+                        origin,
                         last_seen_unix: now_unix,
                         unread_count: 0,
                     };
@@ -1140,12 +1305,17 @@ impl Coordinator {
                                     .recent_peer_hello_sent
                                     .insert(sender_id.clone(), now_inst);
                                 active.recent_hello_sent.insert(remote_addr, now_inst);
+                                let reply_seq = active.next_hello_seq();
+                                let reply_adv_ip =
+                                    active.advertised_ip_for_target(Some(remote_addr.ip()));
                                 let reply = TcpPayload::Hello {
                                     sender_id: active.ephemeral_peer_id.clone(),
                                     sender_name: active.display_name.clone(),
                                     tcp_port: active.tcp_port,
                                     status: active.status,
                                     timestamp: current_unix_timestamp(),
+                                    seq: reply_seq,
+                                    advertised_ip: reply_adv_ip,
                                 };
                                 let cancel = active.cancel.clone();
                                 active.outbound_tasks.spawn(async move {
@@ -1176,8 +1346,8 @@ impl Coordinator {
                 let mut events = Vec::new();
                 if let Some(active) = &mut self.active {
                     if sender_id == &active.ephemeral_peer_id
-                        || sender_id.trim().is_empty()
-                        || message_id.trim().is_empty()
+                        || validate_identifier(sender_id).is_err()
+                        || validate_identifier(message_id).is_err()
                     {
                         return;
                     }
@@ -1207,9 +1377,9 @@ impl Coordinator {
                         }
                     }
 
-                    if validate_received_chat_body(body).is_err() {
+                    let Ok(clean_body) = validate_received_chat_body(body) else {
                         return;
-                    }
+                    };
                     let Ok(clean_name) = validate_and_normalize_display_name(sender_name) else {
                         return;
                     };
@@ -1223,7 +1393,7 @@ impl Coordinator {
                         message_id.clone(),
                         sender_id.clone(),
                         clean_name,
-                        body.clone(),
+                        clean_body,
                         *timestamp,
                         DeliveryState::Received,
                     );
@@ -1268,7 +1438,9 @@ impl Coordinator {
                     }
                     return;
                 }
-                if message_id.trim().is_empty() || receiver_id.trim().is_empty() {
+                if validate_identifier(message_id).is_err()
+                    || validate_identifier(receiver_id).is_err()
+                {
                     return;
                 }
 
@@ -1386,12 +1558,16 @@ impl Coordinator {
             return;
         };
         active.recent_hello_sent.insert(target_addr, Instant::now());
+        let hello_seq = active.next_hello_seq();
+        let advertised_ip = active.advertised_ip_for_target(Some(target_addr.ip()));
         let hello = TcpPayload::Hello {
             sender_id: active.ephemeral_peer_id.clone(),
             sender_name: active.display_name.clone(),
             tcp_port: active.tcp_port,
             status: active.status,
             timestamp: current_unix_timestamp(),
+            seq: hello_seq,
+            advertised_ip,
         };
         let tx = internal_tx.clone();
         let cancel = active.cancel.clone();
@@ -1413,11 +1589,11 @@ impl Coordinator {
     fn handle_send_chat(
         &mut self,
         thread: ThreadKey,
-        raw_body: String,
+        raw_body: Zeroizing<String>,
         internal_tx: &mpsc::Sender<InternalMsg>,
     ) {
         let body = match validate_chat_body(&raw_body) {
-            Ok(b) => b,
+            Ok(b) => Zeroizing::new(b),
             Err(err) => {
                 self.emit(AppEvent::ErrorNotice(err.to_string()));
                 return;
@@ -1449,7 +1625,7 @@ impl Coordinator {
                     message_id.clone(),
                     active.ephemeral_peer_id.clone(),
                     active.display_name.clone(),
-                    body.clone(),
+                    (*body).clone(),
                     now_unix,
                     DeliveryState::DirectSending,
                 );
@@ -1486,7 +1662,7 @@ impl Coordinator {
                     sender_id: active.ephemeral_peer_id.clone(),
                     sender_name: active.display_name.clone(),
                     is_broadcast: false,
-                    body,
+                    body: (*body).clone(),
                     timestamp: now_unix,
                 };
                 let tx = internal_tx.clone();
@@ -1520,7 +1696,7 @@ impl Coordinator {
                     message_id.clone(),
                     active.ephemeral_peer_id.clone(),
                     active.display_name.clone(),
-                    body.clone(),
+                    (*body).clone(),
                     now_unix,
                     DeliveryState::new_broadcast(targets.len()),
                 );
@@ -1561,7 +1737,7 @@ impl Coordinator {
                     sender_id: active.ephemeral_peer_id.clone(),
                     sender_name: active.display_name.clone(),
                     is_broadcast: true,
-                    body,
+                    body: (*body).clone(),
                     timestamp: now_unix,
                 };
                 let tx = internal_tx.clone();
@@ -1781,11 +1957,16 @@ impl Coordinator {
             if let Some(target) = active.udp_target
                 && let Ok(beacon_key) = active.keys.with_beacon_key(|k| Zeroizing::new(*k))
             {
+                let start_seq = active.next_udp_seq();
+                let _ = active.next_udp_seq();
+                let advertised_ip = active.advertised_ip_for_target(Some(target.ip()));
                 let _ = send_encrypted_bye_twice(
                     &active.udp_socket,
                     target,
                     &beacon_key,
                     &active.ephemeral_peer_id,
+                    start_seq,
+                    advertised_ip,
                 )
                 .await;
             }

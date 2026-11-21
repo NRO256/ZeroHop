@@ -46,7 +46,7 @@ pub enum UiCommand {
     CancelLogin,
     SendChat {
         thread: ThreadKey,
-        body: String,
+        body: Zeroizing<String>,
     },
     RetryChat {
         thread: ThreadKey,

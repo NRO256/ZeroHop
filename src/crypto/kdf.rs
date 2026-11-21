@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use subtle::ConstantTimeEq;
@@ -88,13 +88,19 @@ struct LockedKeyMaterial {
 }
 
 impl LockedKeyMaterial {
-    fn new(raw: RawKeyMaterial, room_code: String) -> Self {
-        let boxed = Box::new(raw);
+    fn new_locked_in_place(fill: impl FnOnce(&mut RawKeyMaterial) -> String) -> Self {
+        let mut boxed = Box::new(RawKeyMaterial {
+            msg_key: [0u8; 32],
+            beacon_key: [0u8; 32],
+            lock_verifier: [0u8; 32],
+            temp_disk_key: [0u8; 32],
+        });
         let ptr: *const RawKeyMaterial = &*boxed;
         let virtual_locked = try_virtual_lock(
             ptr.cast::<core::ffi::c_void>(),
             std::mem::size_of::<RawKeyMaterial>(),
         );
+        let room_code = fill(&mut boxed);
         Self {
             raw: boxed,
             room_code,
@@ -320,10 +326,17 @@ fn derive_master_secret(
     validate_password(password)?;
     let argon2_params = Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
         .map_err(|e| CryptoError::KdfFailed(e.to_string()))?;
+    let block_count = argon2_params.block_count();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
+    let mut blocks = Zeroizing::new(vec![Block::default(); block_count]);
     let mut master_secret = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(password.as_bytes(), ARGON2_SALT, &mut *master_secret)
+        .hash_password_into_with_memory(
+            password.as_bytes(),
+            ARGON2_SALT,
+            &mut *master_secret,
+            &mut *blocks,
+        )
         .map_err(|e| CryptoError::KdfFailed(e.to_string()))?;
     Ok(master_secret)
 }
@@ -347,26 +360,28 @@ pub fn derive_session_keys_with_params(
 ) -> Result<SessionKeys, CryptoError> {
     let mut master_secret = derive_master_secret(password, params)?;
 
-    let msg_key = blake3::derive_key(CONTEXT_MSG_KEY, &*master_secret);
-    let beacon_key = blake3::derive_key(CONTEXT_BEACON_KEY, &*master_secret);
-    let lock_verifier = blake3::derive_key(CONTEXT_LOCK_VERIFY, &*master_secret);
-    let mut room_raw = Zeroizing::new(blake3::derive_key(CONTEXT_ROOM_CODE, &*master_secret));
-    let room_code = encode_room_code(&room_raw);
-    room_raw.zeroize();
+    let locked_material = LockedKeyMaterial::new_locked_in_place(|raw| {
+        let msg_key = Zeroizing::new(blake3::derive_key(CONTEXT_MSG_KEY, &*master_secret));
+        raw.msg_key.copy_from_slice(&*msg_key);
+
+        let beacon_key = Zeroizing::new(blake3::derive_key(CONTEXT_BEACON_KEY, &*master_secret));
+        raw.beacon_key.copy_from_slice(&*beacon_key);
+
+        let lock_verifier =
+            Zeroizing::new(blake3::derive_key(CONTEXT_LOCK_VERIFY, &*master_secret));
+        raw.lock_verifier.copy_from_slice(&*lock_verifier);
+
+        let room_raw = Zeroizing::new(blake3::derive_key(CONTEXT_ROOM_CODE, &*master_secret));
+        let room_code = encode_room_code(&room_raw);
+
+        OsRng.fill_bytes(&mut raw.temp_disk_key);
+        room_code
+    });
 
     // ステップ2完了直後に master_secret を即時 zeroize 破棄
     master_secret.zeroize();
 
-    let mut temp_disk_key = [0u8; 32];
-    OsRng.fill_bytes(&mut temp_disk_key);
-
-    let material = RawKeyMaterial {
-        msg_key,
-        beacon_key,
-        lock_verifier,
-        temp_disk_key,
-    };
-    let locked = Arc::new(Mutex::new(LockedKeyMaterial::new(material, room_code)));
+    let locked = Arc::new(Mutex::new(locked_material));
     register_key_material(&locked);
 
     Ok(SessionKeys {

@@ -12,6 +12,7 @@ use crate::storage::StorageError;
 use crate::storage::paths::AppPaths;
 
 static SAVE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+pub const MAX_CONFIG_FILE_BYTES: u64 = 64 * 1024;
 
 /// ディスク設定ファイル（config.json — 非機密動作設定のみ）
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -115,6 +116,27 @@ fn is_readonly_or_permission_error(err: &std::io::Error) -> bool {
 
 pub fn load_config(paths: &AppPaths) -> ConfigLoadResult {
     let config_path = paths.config_path();
+    let meta = match std::fs::metadata(&config_path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return ConfigLoadResult::NotFoundUsingDefault(LocalConfig::default());
+        }
+        Err(err) => {
+            return ConfigLoadResult::CorruptedUsingDefault {
+                config: LocalConfig::default(),
+                reason: format!("設定ファイルメタデータ読込エラー: {err}"),
+            };
+        }
+    };
+    if meta.len() > MAX_CONFIG_FILE_BYTES {
+        return ConfigLoadResult::CorruptedUsingDefault {
+            config: LocalConfig::default(),
+            reason: format!(
+                "設定ファイルサイズが上限（{MAX_CONFIG_FILE_BYTES} バイト）を超過しています: {} バイト",
+                meta.len()
+            ),
+        };
+    }
     let content = match std::fs::read_to_string(&config_path) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -264,6 +286,14 @@ mod tests {
         let corrupt = load_config(&paths);
         assert!(matches!(
             corrupt,
+            ConfigLoadResult::CorruptedUsingDefault { .. }
+        ));
+
+        let oversized = " ".repeat((MAX_CONFIG_FILE_BYTES as usize) + 1);
+        std::fs::write(paths.config_path(), oversized).unwrap();
+        let oversized_res = load_config(&paths);
+        assert!(matches!(
+            oversized_res,
             ConfigLoadResult::CorruptedUsingDefault { .. }
         ));
         let _ = std::fs::remove_dir_all(&dir);

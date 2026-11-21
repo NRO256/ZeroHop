@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,14 +16,17 @@ use crate::domain::protocol::{
     encode_tcp_control_frame, validate_tcp_frame_preamble,
 };
 use crate::network::rate_limit::AnomalyRateLimiter;
+use crate::network::udp_discovery::normalize_ip;
 use crate::network::{AnomalyEvent, NetworkError};
 
 pub const TCP_FALLBACK_PORT_START: u16 = 45101;
 pub const TCP_FALLBACK_PORT_END: u16 = 45120;
 pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const TCP_PREAMBLE_READ_TIMEOUT: Duration = Duration::from_secs(3);
 pub const TCP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONCURRENT_INCOMING_TCP: usize = 64;
+pub const MAX_CONCURRENT_INCOMING_TCP_PER_IP: usize = 8;
 pub const MAX_CONCURRENT_BROADCAST_SENDS: usize = 16;
 
 #[derive(Debug, Error)]
@@ -150,7 +154,7 @@ pub async fn read_tcp_control_frame(
     msg_key: &[u8; 32],
 ) -> Result<TcpPayload, TcpReadError> {
     let mut preamble = [0u8; TCP_PREAMBLE_LEN];
-    tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut preamble))
+    tokio::time::timeout(TCP_PREAMBLE_READ_TIMEOUT, stream.read_exact(&mut preamble))
         .await
         .map_err(|_| TcpReadError::Timeout)??;
 
@@ -217,6 +221,49 @@ async fn handle_incoming_connection(
     }
 }
 
+struct IpConcurrencyGuard {
+    tracker: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl IpConcurrencyGuard {
+    fn try_acquire(
+        tracker: &Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+        raw_ip: IpAddr,
+        limit: usize,
+    ) -> Option<Self> {
+        let ip = normalize_ip(raw_ip);
+        let mut map = tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = map.get(&ip).copied().unwrap_or(0);
+        if count >= limit {
+            return None;
+        }
+        map.insert(ip, count + 1);
+        Some(Self {
+            tracker: Arc::clone(tracker),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpConcurrencyGuard {
+    fn drop(&mut self) {
+        let mut map = self
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = map.get_mut(&self.ip) {
+            if *count <= 1 {
+                map.remove(&self.ip);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
 pub fn spawn_tcp_listener_task(
     listener: TcpListener,
     msg_key: Zeroizing<[u8; 32]>,
@@ -226,6 +273,8 @@ pub fn spawn_tcp_listener_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING_TCP));
+        let ip_tracker: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let mut conn_tasks = JoinSet::new();
 
         loop {
@@ -236,10 +285,37 @@ pub fn spawn_tcp_listener_task(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, remote_addr)) = accepted else {
-                        break;
+                    let (stream, remote_addr) = match accepted {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::WouldBlock
+                            ) {
+                                continue;
+                            }
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
+                            }
+                        }
+                    };
+                    let Some(ip_guard) = IpConcurrencyGuard::try_acquire(
+                        &ip_tracker,
+                        remote_addr.ip(),
+                        MAX_CONCURRENT_INCOMING_TCP_PER_IP,
+                    ) else {
+                        drop(stream);
+                        continue;
                     };
                     let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                        drop(ip_guard);
                         drop(stream);
                         continue;
                     };
@@ -248,6 +324,7 @@ pub fn spawn_tcp_listener_task(
                     let limiter_clone = Arc::clone(&anomaly_limiter);
                     let conn_cancel = cancel.clone();
                     conn_tasks.spawn(async move {
+                        let _ip_guard = ip_guard;
                         let _permit = permit;
                         tokio::select! {
                             _ = conn_cancel.cancelled() => {},
@@ -318,6 +395,8 @@ mod tests {
             tcp_port: 45101,
             status: UserStatus::Online,
             timestamp: 1_700_000_000,
+            seq: 1,
+            advertised_ip: Some(ip),
         };
         send_tcp_control_frame(target, &wrong_key, &hello)
             .await
@@ -403,5 +482,84 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_survives_reset_and_caps_per_ip_concurrent_connections() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (listener, port) = bind_tcp_listener(ip, 0).await.unwrap();
+        let target = SocketAddr::new(ip, port);
+
+        let key = Zeroizing::new([0x66u8; 32]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let limiter = Arc::new(Mutex::new(AnomalyRateLimiter::default_anomaly()));
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_tcp_listener_task(listener, key.clone(), tx, limiter, cancel.clone());
+
+        // 1. 接続直後の強制切断（RST 相当）後もリスナーが停止しないこと
+        {
+            let reset_sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .unwrap();
+            reset_sock.set_linger(Some(Duration::ZERO)).unwrap();
+            reset_sock.connect(&target.into()).unwrap();
+            drop(reset_sock);
+        }
+
+        // 2. 同一 IP から IP 上限 (8本) の無送信ストリームを張り、9本目は即拒否されること
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_INCOMING_TCP_PER_IP {
+            let s = TcpStream::connect(target).await.unwrap();
+            held.push(s);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let overflow_res = send_tcp_control_frame(
+            target,
+            &key,
+            &TcpPayload::Ack {
+                message_id: "m-over".to_string(),
+                receiver_id: "peer-1".to_string(),
+                timestamp: 1_700_000_000,
+            },
+        )
+        .await;
+        // サーバー側で即閉じられる、あるいはタイムアウトまでに受理されない
+        if overflow_res.is_ok() {
+            let maybe = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+            assert!(
+                maybe.is_err(),
+                "9th concurrent connection from same IP must not be processed"
+            );
+        }
+
+        // 保持ストリームを解放すれば再度正常に受信できること
+        held.clear();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let ack_ok = TcpPayload::Ack {
+            message_id: "m-ok".to_string(),
+            receiver_id: "peer-1".to_string(),
+            timestamp: 1_700_000_000,
+        };
+        send_tcp_control_frame(target, &key, &ack_ok).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ev,
+            InboundTcpEvent::Payload(InboundTcpMessage {
+                peer_ip: ip,
+                payload: ack_ok,
+            })
+        );
+
+        cancel.cancel();
+        handle.await.unwrap();
     }
 }

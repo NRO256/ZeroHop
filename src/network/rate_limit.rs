@@ -28,7 +28,7 @@ impl UdpIpRateLimiter {
         if self.entries.len() >= MAX_TRACKED_IPS && !self.entries.contains_key(&ip) {
             self.prune_stale(now);
             if self.entries.len() >= MAX_TRACKED_IPS {
-                return false;
+                self.evict_oldest(now);
             }
         }
 
@@ -60,6 +60,17 @@ impl UdpIpRateLimiter {
             }
             !queue.is_empty()
         });
+    }
+
+    fn evict_oldest(&mut self, now: Instant) {
+        let oldest_ip = self
+            .entries
+            .iter()
+            .min_by_key(|(_, queue)| queue.back().copied().unwrap_or(now))
+            .map(|(ip, _)| *ip);
+        if let Some(ip) = oldest_ip {
+            self.entries.remove(&ip);
+        }
     }
 }
 
@@ -164,5 +175,23 @@ mod tests {
         // 60秒経過で再度許可
         assert!(limiter.allow_at(ip1, t0 + Duration::from_secs(60)));
         assert!(limiter.allow_at(ip11, t0 + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn udp_ip_limiter_evicts_oldest_ip_instead_of_starving_new_peers() {
+        let mut limiter = UdpIpRateLimiter::default_udp();
+        let t0 = Instant::now();
+
+        for i in 0..MAX_TRACKED_IPS {
+            let b2 = ((i >> 8) & 0xFF) as u8;
+            let b3 = (i & 0xFF) as u8;
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, b2, b3));
+            assert!(limiter.allow_at(ip, t0 + Duration::from_millis(i as u64)));
+        }
+
+        // 513 番目の正規 IP は最古 (10.0.0.0) を LRU 退避して受理される
+        let legitimate_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 10, 50));
+        assert!(limiter.allow_at(legitimate_ip, t0 + Duration::from_millis(600)));
+        assert_eq!(limiter.entries.len(), MAX_TRACKED_IPS);
     }
 }

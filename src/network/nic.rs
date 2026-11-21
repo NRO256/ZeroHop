@@ -186,7 +186,7 @@ mod win_impl {
         if family != AF_INET {
             return None;
         }
-        let sin = unsafe { *(sa.lpSockaddr as *const SOCKADDR_IN) };
+        let sin = unsafe { std::ptr::read_unaligned(sa.lpSockaddr as *const SOCKADDR_IN) };
         let raw_addr = unsafe { sin.sin_addr.S_un.S_addr };
         Some(Ipv4Addr::from(raw_addr.to_ne_bytes()))
     }

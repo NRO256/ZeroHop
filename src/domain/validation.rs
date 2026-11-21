@@ -7,6 +7,7 @@ use crate::domain::model::{
 };
 
 const MAX_SANITIZED_FILENAME_CHARS: usize = 200;
+pub const MAX_IDENTIFIER_BYTES: usize = 64;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -29,6 +30,8 @@ pub enum ValidationError {
         max_bytes: usize,
         actual_bytes: usize,
     },
+    #[error("識別子の形式または長さが不正です")]
+    InvalidIdentifier,
     #[error("ポート番号は1から65535の範囲で指定してください")]
     InvalidPort,
     #[error("有効なIPアドレス（IPv4またはIPv6）を指定してください")]
@@ -139,17 +142,18 @@ pub fn validate_chat_body(raw: &str) -> Result<String, ValidationError> {
     Ok(normalized)
 }
 
-pub fn validate_received_chat_body(body: &str) -> Result<(), ValidationError> {
-    if body.trim().is_empty() {
-        return Err(ValidationError::EmptyChatBody);
-    }
-    if body.len() > MAX_CHAT_BODY_BYTES {
-        return Err(ValidationError::ChatBodyTooLong {
-            max_bytes: MAX_CHAT_BODY_BYTES,
-            actual_bytes: body.len(),
-        });
+pub fn validate_identifier(raw: &str) -> Result<(), ValidationError> {
+    if raw.is_empty()
+        || raw.len() > MAX_IDENTIFIER_BYTES
+        || !raw.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(ValidationError::InvalidIdentifier);
     }
     Ok(())
+}
+
+pub fn validate_received_chat_body(body: &str) -> Result<String, ValidationError> {
+    validate_chat_body(body)
 }
 
 pub fn validate_port(port: u16) -> Result<u16, ValidationError> {
@@ -414,5 +418,37 @@ mod tests {
             validate_file_size(MAX_FILE_TRANSFER_BYTES + 1),
             Err(ValidationError::InvalidFileSize)
         );
+    }
+
+    #[test]
+    fn identifier_and_received_body_sanitize_reject_malformed_inputs() {
+        assert!(validate_identifier("peer-uuid-1234_ABCD").is_ok());
+        assert_eq!(
+            validate_identifier(&"a".repeat(MAX_IDENTIFIER_BYTES)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_identifier(&"a".repeat(MAX_IDENTIFIER_BYTES + 1)),
+            Err(ValidationError::InvalidIdentifier)
+        );
+        assert_eq!(
+            validate_identifier(""),
+            Err(ValidationError::InvalidIdentifier)
+        );
+        assert_eq!(
+            validate_identifier("id with space"),
+            Err(ValidationError::InvalidIdentifier)
+        );
+        assert_eq!(
+            validate_identifier("id\x1b[31m"),
+            Err(ValidationError::InvalidIdentifier)
+        );
+
+        let sanitized =
+            validate_received_chat_body("受信\r\n本文\x00\x1b[31m\t保持\r末尾").unwrap();
+        assert_eq!(sanitized, "受信\n本文[31m\t保持\n末尾");
+        assert!(!sanitized.contains('\0'));
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\r'));
     }
 }

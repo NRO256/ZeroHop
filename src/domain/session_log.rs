@@ -75,7 +75,7 @@ impl SessionLog {
         thread: ThreadKey,
         mut msg: InMemoryChatMessage,
     ) -> Result<PushOutcome, ValidationError> {
-        validate_received_chat_body(&msg.body)?;
+        msg.body = validate_received_chat_body(&msg.body)?;
         msg.approx_bytes = msg.compute_approx_bytes();
 
         let mut evicted_from_thread = 0usize;

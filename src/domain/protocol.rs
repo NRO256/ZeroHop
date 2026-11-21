@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -90,10 +92,20 @@ pub enum UdpPayload {
         #[zeroize(skip)]
         status: UserStatus,
         timestamp: i64,
+        #[serde(default)]
+        seq: u64,
+        #[zeroize(skip)]
+        #[serde(default)]
+        advertised_ip: Option<IpAddr>,
     },
     Bye {
         peer_id: String,
         timestamp: i64,
+        #[serde(default)]
+        seq: u64,
+        #[zeroize(skip)]
+        #[serde(default)]
+        advertised_ip: Option<IpAddr>,
     },
 }
 
@@ -108,6 +120,11 @@ pub enum TcpPayload {
         #[zeroize(skip)]
         status: UserStatus,
         timestamp: i64,
+        #[serde(default)]
+        seq: u64,
+        #[zeroize(skip)]
+        #[serde(default)]
+        advertised_ip: Option<IpAddr>,
     },
     Chat {
         message_id: String,
@@ -479,6 +496,8 @@ mod tests {
             tcp_port: 45101,
             status: UserStatus::Online,
             timestamp: 1_700_000_000,
+            seq: 1,
+            advertised_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 10, 6))),
         };
         let frame = encode_udp_frame(&beacon_key, &beacon).unwrap();
         assert!(frame.len() <= MAX_UDP_PACKET_BYTES);
@@ -491,6 +510,8 @@ mod tests {
         let bye = UdpPayload::Bye {
             peer_id: "peer-uuid-1".to_string(),
             timestamp: 1_700_000_010,
+            seq: 2,
+            advertised_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 10, 6))),
         };
         let bye_frame = encode_udp_frame(&beacon_key, &bye).unwrap();
         assert_eq!(decode_udp_frame(&beacon_key, &bye_frame).unwrap(), bye);
@@ -540,6 +561,8 @@ mod tests {
                 tcp_port: 45101,
                 status: UserStatus::Away,
                 timestamp: 100,
+                seq: 1,
+                advertised_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 10, 6))),
             },
             TcpPayload::Chat {
                 message_id: "m1".to_string(),

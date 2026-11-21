@@ -167,7 +167,7 @@ async fn manual_peer_hello_direct_ack_and_broadcast_selective_retry() {
         .cmd_tx
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(bob_id.clone()),
-            body: "1対1の暗号化メッセージ".to_string(),
+            body: Zeroizing::new("1対1の暗号化メッセージ".to_string()),
         })
         .await
         .unwrap();
@@ -221,6 +221,8 @@ async fn manual_peer_hello_direct_ack_and_broadcast_selective_retry() {
             tcp_port: carol_port,
             status: UserStatus::Online,
             timestamp: current_unix_timestamp(),
+            seq: 1,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         },
     )
     .await
@@ -246,7 +248,7 @@ async fn manual_peer_hello_direct_ack_and_broadcast_selective_retry() {
         .cmd_tx
         .send(UiCommand::SendChat {
             thread: ThreadKey::Broadcast,
-            body: "全体チャット集合Ackテスト".to_string(),
+            body: Zeroizing::new("全体チャット集合Ackテスト".to_string()),
         })
         .await
         .unwrap();
@@ -404,6 +406,8 @@ async fn unauthenticated_and_tampered_packets_are_rejected_and_anomalies_rate_li
             tcp_port: 45101,
             status: UserStatus::Online,
             timestamp: current_unix_timestamp(),
+            seq: 1,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         },
     )
     .unwrap();
@@ -594,7 +598,7 @@ async fn full_login_chat_logout_relogin_lifecycle() {
         .cmd_tx
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(peer_id1.clone()),
-            body: "セッション1の会話".to_string(),
+            body: Zeroizing::new("セッション1の会話".to_string()),
         })
         .await
         .unwrap();
@@ -648,7 +652,7 @@ async fn full_login_chat_logout_relogin_lifecycle() {
         .cmd_tx
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(peer_id2),
-            body: "セッション2の会話".to_string(),
+            body: Zeroizing::new("セッション2の会話".to_string()),
         })
         .await
         .unwrap();
@@ -681,7 +685,7 @@ async fn zero_persistence_leaves_no_files_and_cleans_residual_cache() {
     node.cmd_tx
         .send(UiCommand::SendChat {
             thread: ThreadKey::Broadcast,
-            body: "極秘の会話メッセージXYZ".to_string(),
+            body: Zeroizing::new("極秘の会話メッセージXYZ".to_string()),
         })
         .await
         .unwrap();
@@ -729,5 +733,224 @@ async fn zero_persistence_leaves_no_files_and_cleans_residual_cache() {
     assert!(!paths.cache_dir().exists());
     assert!(!paths.config_path().exists());
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sec001_sec005_blocks_reflection_replay_manual_promotion_and_sanitizes_chat() {
+    let dir = temp_base_dir("m3_sec_hardening");
+    let mut opts = CoordinatorOptions::loopback_for_test(AppPaths::from_base_dir(dir.clone()));
+    opts.peer_timeout_secs = 2;
+    let pass = "SecurityRoom#2026";
+    let (victim, rx_v) = spawn_test_node(opts);
+    let (_, _, v_tcp_port, v_udp_port) = login_node(&victim, &rx_v, "Victim", pass).await;
+
+    let keys = derive_session_keys_with_params(pass, fast_argon2()).unwrap();
+    let msg_key = keys.with_msg_key(|k| Zeroizing::new(*k)).unwrap();
+    let beacon_key = keys.with_beacon_key(|k| Zeroizing::new(*k)).unwrap();
+
+    let v_udp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v_udp_port);
+    let v_tcp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v_tcp_port);
+    let attacker_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. 正規 peer (192.168.10.50 を advertised_ip として持つ) の Beacon / Hello を別 IP (127.0.0.1) から反射 -> 拒否
+    let spoofed_beacon = encode_udp_frame(
+        &beacon_key,
+        &UdpPayload::Beacon {
+            peer_id: "legit-peer-1".to_string(),
+            display_name: "Legit".to_string(),
+            tcp_port: 45111,
+            status: UserStatus::Online,
+            timestamp: current_unix_timestamp(),
+            seq: 1,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 50))),
+        },
+    )
+    .unwrap();
+    attacker_udp
+        .send_to(&spoofed_beacon, v_udp_addr)
+        .await
+        .unwrap();
+
+    send_tcp_control_frame(
+        v_tcp_addr,
+        &msg_key,
+        &TcpPayload::Hello {
+            sender_id: "legit-peer-1".to_string(),
+            sender_name: "Legit".to_string(),
+            tcp_port: 45111,
+            status: UserStatus::Online,
+            timestamp: current_unix_timestamp(),
+            seq: 1,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 50))),
+        },
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen_before: Vec<AppEvent> = rx_v.try_iter().collect();
+    assert!(
+        !seen_before
+            .iter()
+            .any(|ev| matches!(ev, AppEvent::PeerJoined { .. })),
+        "reflected Beacon/Hello with mismatched advertised_ip must be rejected: {seen_before:?}"
+    );
+
+    // 2. 正常な Beacon (seq=10) -> Bye (seq=11) の直後に過去 Beacon (seq=10) をリプレイしてもゴースト復活しないこと
+    let replay_beacon_10 = encode_udp_frame(
+        &beacon_key,
+        &UdpPayload::Beacon {
+            peer_id: "legit-peer-1".to_string(),
+            display_name: "Legit".to_string(),
+            tcp_port: 45111,
+            status: UserStatus::Online,
+            timestamp: current_unix_timestamp(),
+            seq: 10,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        },
+    )
+    .unwrap();
+    attacker_udp
+        .send_to(&replay_beacon_10, v_udp_addr)
+        .await
+        .unwrap();
+    wait_for_event(
+        &rx_v,
+        Duration::from_secs(3),
+        |ev| matches!(ev, AppEvent::PeerJoined { peer_id, .. } if peer_id == "legit-peer-1"),
+    )
+    .await;
+
+    let bye_11 = encode_udp_frame(
+        &beacon_key,
+        &UdpPayload::Bye {
+            peer_id: "legit-peer-1".to_string(),
+            timestamp: current_unix_timestamp(),
+            seq: 11,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        },
+    )
+    .unwrap();
+    attacker_udp.send_to(&bye_11, v_udp_addr).await.unwrap();
+    wait_for_event(
+        &rx_v,
+        Duration::from_secs(3),
+        |ev| matches!(ev, AppEvent::PeerListChanged(list) if list.is_empty()),
+    )
+    .await;
+
+    attacker_udp
+        .send_to(&replay_beacon_10, v_udp_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_replay: Vec<AppEvent> = rx_v.try_iter().collect();
+    assert!(
+        !after_replay
+            .iter()
+            .any(|ev| matches!(ev, AppEvent::PeerJoined { .. })),
+        "replayed Beacon(seq=10) after Bye(seq=11) must be ignored: {after_replay:?}"
+    );
+
+    // 3. Discovered ピア (seq=12) に対し unsolicited Hello (seq=1) を送っても Manual 永続昇格せず、2秒タイムアウトで除去される
+    let beacon_12 = encode_udp_frame(
+        &beacon_key,
+        &UdpPayload::Beacon {
+            peer_id: "legit-peer-1".to_string(),
+            display_name: "Legit".to_string(),
+            tcp_port: 45111,
+            status: UserStatus::Online,
+            timestamp: current_unix_timestamp(),
+            seq: 12,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        },
+    )
+    .unwrap();
+    attacker_udp.send_to(&beacon_12, v_udp_addr).await.unwrap();
+    wait_for_event(
+        &rx_v,
+        Duration::from_secs(3),
+        |ev| matches!(ev, AppEvent::PeerJoined { peer_id, .. } if peer_id == "legit-peer-1"),
+    )
+    .await;
+
+    send_tcp_control_frame(
+        v_tcp_addr,
+        &msg_key,
+        &TcpPayload::Hello {
+            sender_id: "legit-peer-1".to_string(),
+            sender_name: "Legit".to_string(),
+            tcp_port: 45111,
+            status: UserStatus::Online,
+            timestamp: current_unix_timestamp(),
+            seq: 1,
+            advertised_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        },
+    )
+    .await
+    .unwrap();
+
+    // peer_timeout_secs = 2 秒＋スウィープ間隔 1 秒以内に Discovered としてオフライン除去される
+    wait_for_event(
+        &rx_v,
+        Duration::from_secs(5),
+        |ev| matches!(ev, AppEvent::PeerListChanged(list) if list.is_empty()),
+    )
+    .await;
+
+    // 4. SEC-005: 65バイト超 message_id / sender_id は拒否され、正常IDの Chat 本文は制御文字サニタイズされる
+    send_tcp_control_frame(
+        v_tcp_addr,
+        &msg_key,
+        &TcpPayload::Chat {
+            message_id: "x".repeat(65),
+            sender_id: "legit-peer-2".to_string(),
+            sender_name: "Legit2".to_string(),
+            is_broadcast: true,
+            body: "拒否されるべき長大ID".to_string(),
+            timestamp: current_unix_timestamp(),
+        },
+    )
+    .await
+    .unwrap();
+
+    send_tcp_control_frame(
+        v_tcp_addr,
+        &msg_key,
+        &TcpPayload::Chat {
+            message_id: "msg-clean-1".to_string(),
+            sender_id: "legit-peer-2".to_string(),
+            sender_name: "Legit2".to_string(),
+            is_broadcast: true,
+            body: "安全\r\n本文\x00\x1b[31mOK".to_string(),
+            timestamp: current_unix_timestamp(),
+        },
+    )
+    .await
+    .unwrap();
+
+    wait_for_event(&rx_v, Duration::from_secs(3), |ev| {
+        matches!(
+            ev,
+            AppEvent::ThreadUpdated {
+                thread: ThreadKey::Broadcast,
+                new_count: 1,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(victim.log_reader.thread_len(&ThreadKey::Broadcast), 1);
+    let stored = victim
+        .log_reader
+        .with_message(&ThreadKey::Broadcast, 0, |m| {
+            (m.message_id.clone(), m.body.clone())
+        })
+        .unwrap();
+    assert_eq!(stored.0, "msg-clean-1");
+    assert_eq!(stored.1, "安全\n本文[31mOK");
+
+    shutdown_node(victim, &rx_v).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
