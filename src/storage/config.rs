@@ -28,6 +28,7 @@ pub struct LocalConfig {
     pub sound_on_message: bool,
     pub send_on_enter: bool,
     pub hide_notification_preview: bool,
+    pub auto_away_minutes: u16,
 }
 
 impl Default for LocalConfig {
@@ -43,6 +44,7 @@ impl Default for LocalConfig {
             sound_on_message: true,
             send_on_enter: false,
             hide_notification_preview: false,
+            auto_away_minutes: 5,
         }
     }
 }
@@ -58,6 +60,7 @@ impl LocalConfig {
         self.max_memory_mb = self
             .max_memory_mb
             .clamp(MIN_MAX_MEMORY_MB, MAX_MAX_MEMORY_MB);
+        self.auto_away_minutes = self.auto_away_minutes.min(60);
 
         self.preferred_nic_ip = self
             .preferred_nic_ip

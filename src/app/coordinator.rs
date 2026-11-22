@@ -11,7 +11,9 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::state::{AppEvent, AppStateKind, UiCommand, can_transition};
-use crate::crypto::kdf::{Argon2Params, SessionKeys, derive_session_keys_with_params};
+use crate::crypto::kdf::{
+    Argon2Params, SessionKeys, derive_lock_verifier, derive_session_keys_with_params,
+};
 use crate::crypto::replay::{
     DEFAULT_TIMESTAMP_WINDOW_SECS, ReplayCache, ReplayCheckError, check_timestamp_window,
 };
@@ -20,7 +22,7 @@ use crate::domain::model::{
     ThreadKey, UserStatus,
 };
 use crate::domain::protocol::{TcpPayload, UdpPayload};
-use crate::domain::session_log::SessionLog;
+use crate::domain::session_log::{SearchHit, SessionLog};
 use crate::domain::validation::{
     validate_and_normalize_display_name, validate_chat_body, validate_identifier,
     validate_manual_peer_endpoint, validate_password, validate_port, validate_received_chat_body,
@@ -141,6 +143,19 @@ impl SessionLogReader {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.current_total_bytes()
     }
+
+    pub fn search(
+        &self,
+        thread_filter: Option<&ThreadKey>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<SearchHit> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.search(thread_filter, query, limit)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +237,9 @@ enum InternalMsg {
         target_addr: SocketAddr,
         temp_id: String,
         result: Result<(), String>,
+    },
+    UnlockCheckFinished {
+        candidate: Option<Zeroizing<[u8; 32]>>,
     },
 }
 
@@ -437,23 +455,33 @@ impl Coordinator {
             }
             UiCommand::CancelLogin => false,
             UiCommand::SendChat { thread, body } => {
-                self.handle_send_chat(thread, body, internal_tx);
+                if self.state == AppStateKind::LoggedIn {
+                    self.handle_send_chat(thread, body, internal_tx);
+                }
                 false
             }
             UiCommand::RetryChat { thread, message_id } => {
-                self.handle_retry_chat(thread, message_id, internal_tx);
+                if self.state == AppStateKind::LoggedIn {
+                    self.handle_retry_chat(thread, message_id, internal_tx);
+                }
                 false
             }
             UiCommand::AddManualPeer { host, tcp_port } => {
-                self.handle_add_manual_peer(&host, tcp_port, internal_tx);
+                if self.state == AppStateKind::LoggedIn {
+                    self.handle_add_manual_peer(&host, tcp_port, internal_tx);
+                }
                 false
             }
             UiCommand::RefreshNetwork => {
-                self.handle_refresh_network();
+                if self.state == AppStateKind::LoggedIn {
+                    self.handle_refresh_network();
+                }
                 false
             }
             UiCommand::ChangeStatus(new_status) => {
-                if let Some(active) = &mut self.active {
+                if self.state == AppStateKind::LoggedIn
+                    && let Some(active) = &mut self.active
+                {
                     active.status = new_status;
                     self.emit(AppEvent::StatusChanged(new_status));
                     self.send_single_beacon_async();
@@ -461,7 +489,9 @@ impl Coordinator {
                 false
             }
             UiCommand::ClearSessionChat { thread } => {
-                self.handle_clear_session_chat(thread);
+                if self.state == AppStateKind::LoggedIn {
+                    self.handle_clear_session_chat(thread);
+                }
                 false
             }
             UiCommand::UpdateConfig(mut new_cfg) => {
@@ -493,6 +523,31 @@ impl Coordinator {
                     self.emit(AppEvent::ErrorNotice(format!(
                         "設定の保存に失敗しました: {err}"
                     )));
+                }
+                false
+            }
+            UiCommand::LockScreen => {
+                if self.state == AppStateKind::LoggedIn && self.active.is_some() {
+                    self.set_state(AppStateKind::Locked);
+                    self.emit(AppEvent::ScreenLocked);
+                }
+                false
+            }
+            UiCommand::UnlockScreen { password } => {
+                if self.state == AppStateKind::Locked && self.active.is_some() {
+                    let params = self.options.argon2_params;
+                    let tx = internal_tx.clone();
+                    tokio::spawn(async move {
+                        let candidate = tokio::task::spawn_blocking(move || {
+                            derive_lock_verifier(&password, params).ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        let _ = tx
+                            .send(InternalMsg::UnlockCheckFinished { candidate })
+                            .await;
+                    });
                 }
                 false
             }
@@ -961,6 +1016,19 @@ impl Coordinator {
                     )));
                 }
             }
+            InternalMsg::UnlockCheckFinished { candidate } => {
+                let ok = if self.state == AppStateKind::Locked
+                    && let (Some(active), Some(cand)) = (&self.active, candidate.as_ref())
+                {
+                    active.keys.verify_lock_verifier(cand)
+                } else {
+                    false
+                };
+                if ok {
+                    self.set_state(AppStateKind::LoggedIn);
+                }
+                self.emit(AppEvent::ScreenUnlockResult { ok });
+            }
         }
     }
 
@@ -1389,10 +1457,15 @@ impl Coordinator {
                     } else {
                         ThreadKey::Peer(sender_id.clone())
                     };
+                    let preview: String = clean_body
+                        .replace(['\r', '\n'], " ")
+                        .chars()
+                        .take(60)
+                        .collect();
                     let chat_msg = InMemoryChatMessage::new(
                         message_id.clone(),
                         sender_id.clone(),
-                        clean_name,
+                        clean_name.clone(),
                         clean_body,
                         *timestamp,
                         DeliveryState::Received,
@@ -1411,9 +1484,14 @@ impl Coordinator {
 
                     if let (Ok(_), new_count, total_log_bytes) = push_res {
                         events.push(AppEvent::ThreadUpdated {
-                            thread,
+                            thread: thread.clone(),
                             new_count,
                             total_log_bytes,
+                        });
+                        events.push(AppEvent::IncomingMessageReceived {
+                            thread,
+                            sender_name: clean_name,
+                            preview,
                         });
                         spawn_ack_reply_for(active, sender_id, message_id);
                     }

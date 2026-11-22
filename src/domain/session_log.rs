@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::domain::model::{InMemoryChatMessage, MAX_MESSAGES_PER_THREAD, ThreadKey};
 use crate::domain::validation::{ValidationError, validate_received_chat_body};
@@ -9,6 +9,29 @@ use crate::domain::validation::{ValidationError, validate_received_chat_body};
 struct StoredMessage {
     seq: u64,
     message: InMemoryChatMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct SearchHit {
+    #[zeroize(skip)]
+    pub thread: ThreadKey,
+    pub index: usize,
+    pub sender_name: String,
+    pub timestamp: i64,
+    pub preview: String,
+}
+
+fn summarize_preview(body: &str, max_chars: usize) -> String {
+    let single_line = body.replace(['\r', '\n'], " ");
+    let mut out = String::new();
+    for (count, ch) in single_line.chars().enumerate() {
+        if count >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +287,68 @@ impl SessionLog {
         self.current_total_bytes = 0;
         count
     }
+
+    pub fn search(
+        &self,
+        thread_filter: Option<&ThreadKey>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<SearchHit> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let needle = trimmed.to_lowercase();
+        let mut hits: Vec<(u64, SearchHit)> = Vec::new();
+
+        match thread_filter {
+            Some(thread) => {
+                if let Some(queue) = self.threads.get(thread) {
+                    for (idx, stored) in queue.iter().enumerate() {
+                        if stored.message.body.to_lowercase().contains(&needle)
+                            || stored.message.sender_name.to_lowercase().contains(&needle)
+                        {
+                            hits.push((
+                                stored.seq,
+                                SearchHit {
+                                    thread: thread.clone(),
+                                    index: idx,
+                                    sender_name: stored.message.sender_name.clone(),
+                                    timestamp: stored.message.timestamp,
+                                    preview: summarize_preview(&stored.message.body, 80),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                for (thread, queue) in &self.threads {
+                    for (idx, stored) in queue.iter().enumerate() {
+                        if stored.message.body.to_lowercase().contains(&needle)
+                            || stored.message.sender_name.to_lowercase().contains(&needle)
+                        {
+                            hits.push((
+                                stored.seq,
+                                SearchHit {
+                                    thread: thread.clone(),
+                                    index: idx,
+                                    sender_name: stored.message.sender_name.clone(),
+                                    timestamp: stored.message.timestamp,
+                                    preview: summarize_preview(&stored.message.body, 80),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 新しい順に並べて limit 件に絞る
+        hits.sort_by_key(|a| std::cmp::Reverse(a.0));
+        hits.truncate(limit);
+        hits.into_iter().map(|(_, hit)| hit).collect()
+    }
 }
 
 impl Drop for SessionLog {
@@ -417,5 +502,35 @@ mod tests {
         assert!(msg.body.is_empty());
         assert_eq!(msg.timestamp, 0);
         assert_eq!(msg.approx_bytes, 0);
+    }
+
+    #[test]
+    fn search_finds_case_insensitive_matches_and_zeroizes_hits() {
+        let mut log = SessionLog::new(1024 * 1024);
+        log.push_message(ThreadKey::Broadcast, make_msg("1", "Hello LAN World", 10))
+            .unwrap();
+        log.push_message(
+            ThreadKey::Peer("peer-1".into()),
+            make_msg("2", "Confidential Report", 20),
+        )
+        .unwrap();
+        log.push_message(ThreadKey::Broadcast, make_msg("3", "lan status ok", 30))
+            .unwrap();
+
+        assert!(log.search(None, "   ", 10).is_empty());
+
+        let all_hits = log.search(None, "LAN", 10);
+        assert_eq!(all_hits.len(), 2);
+        assert_eq!(all_hits[0].index, 1); // 新しい順
+        assert_eq!(all_hits[1].index, 0);
+
+        let peer_hits = log.search(Some(&ThreadKey::Peer("peer-1".into())), "report", 10);
+        assert_eq!(peer_hits.len(), 1);
+        assert_eq!(peer_hits[0].index, 0);
+
+        let mut hit = peer_hits.into_iter().next().unwrap();
+        hit.zeroize();
+        assert!(hit.sender_name.is_empty());
+        assert!(hit.preview.is_empty());
     }
 }

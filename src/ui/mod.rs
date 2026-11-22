@@ -5,9 +5,11 @@ pub mod dialogs;
 pub mod login_view;
 pub mod main_view;
 pub mod menu_bar;
+pub mod sound;
 pub mod state_helpers;
 pub mod theme;
 
+use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
@@ -22,21 +24,23 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, VK_CONTROL, VK_DELETE, VK_F5, VK_F6, VK_MENU, VK_RETURN, VK_SHIFT,
+    GetFocus, GetKeyState, GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_DELETE, VK_F5, VK_F6,
+    VK_MENU, VK_RETURN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, GetClientRect, GetMessageW, IDC_ARROW,
-    IsDialogMessageW, LBN_SELCHANGE, LoadCursorW, MINMAXINFO, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetMenu, SetWindowPos,
-    ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WNDCLASSEXW,
-    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
+    IsDialogMessageW, KillTimer, LBN_SELCHANGE, LoadCursorW, MINMAXINFO, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+    SetMenu, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -51,7 +55,7 @@ use lan_messenger::storage::paths::AppPaths;
 use a11y::{cycle_main_pane_focus, focus_control};
 use dialogs::{
     confirm_logout_or_exit, show_about_dialog, show_add_manual_peer_dialog,
-    show_connection_info_dialog, show_options_dialog, show_shortcuts_dialog,
+    show_connection_info_dialog, show_options_dialog, show_search_dialog, show_shortcuts_dialog,
 };
 use login_view::{
     create_login_controls, layout_login_controls, reset_login_form, set_authenticating_ui,
@@ -59,13 +63,17 @@ use login_view::{
     update_password_guide,
 };
 use main_view::{
-    apply_clear_main_controls, create_main_controls, drain_app_events, extract_clear_main_args,
-    handle_lv_getdispinfo, handle_peer_list_selchange, layout_main_controls,
-    open_selected_message_detail, remove_main_subclasses, retry_selected_message,
-    send_current_input, set_notice_text, show_main_controls, update_input_byte_guide,
-    update_status_bar,
+    apply_clear_main_controls, clear_unread_for_thread, create_lock_controls, create_main_controls,
+    drain_app_events, extract_clear_main_args, handle_lv_getdispinfo, handle_peer_list_selchange,
+    jump_to_search_hit, layout_lock_controls, layout_main_controls, open_selected_message_detail,
+    refresh_peer_list, remove_main_subclasses, remove_tray_icon, retry_selected_message,
+    send_current_input, set_input_send_on_enter, set_notice_text, show_lock_controls,
+    show_main_controls, submit_unlock, update_input_byte_guide, update_status_bar,
 };
-use menu_bar::{create_main_menu_bar, sync_menu_enabled_state, sync_status_menu_check};
+use menu_bar::{
+    create_main_menu_bar, sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check,
+};
+use sound::SoundController;
 use state_helpers::{
     UiHandles, UiState, clear_thread_locals, guard_wnd_proc, init_thread_locals, with_state,
     with_state_mut, with_ui, with_ui_and_state, with_ui_and_state_mut,
@@ -80,8 +88,11 @@ pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) const WM_APP_EVENT: u32 = WM_APP + 1;
 pub(crate) const WM_APP_OPEN_DETAIL: u32 = WM_APP + 2;
+pub(crate) const WM_APP_TRAY_CALLBACK: u32 = WM_APP + 3;
 
-// メニューコマンド ID (Phase 1 範囲のみ)
+pub(crate) const TIMER_AUTO_AWAY: usize = 1;
+
+// メニューコマンド ID (Phase 1〜2)
 pub(crate) const IDM_STATUS_ONLINE: usize = 1001;
 pub(crate) const IDM_STATUS_AWAY: usize = 1002;
 pub(crate) const IDM_STATUS_BUSY: usize = 1003;
@@ -97,6 +108,10 @@ pub(crate) const IDM_CONN_INFO: usize = 1012;
 pub(crate) const IDM_OPTIONS: usize = 1013;
 pub(crate) const IDM_SHORTCUTS: usize = 1014;
 pub(crate) const IDM_ABOUT: usize = 1015;
+pub(crate) const IDM_LOCK_SCREEN: usize = 1016;
+pub(crate) const IDM_SEARCH: usize = 1017;
+pub(crate) const IDM_TOGGLE_SOUND: usize = 1018;
+pub(crate) const IDM_TOGGLE_SEND_ON_ENTER: usize = 1019;
 
 // ログイン画面コントロール ID
 pub(crate) const IDC_LOGIN_TITLE: usize = 2001;
@@ -122,6 +137,15 @@ pub(crate) const IDC_MAIN_BYTE_GUIDE: usize = 3006;
 pub(crate) const IDC_MAIN_INPUT_EDIT: usize = 3007;
 pub(crate) const IDC_MAIN_SEND_BTN: usize = 3008;
 pub(crate) const IDC_MAIN_STATUSBAR: usize = 3009;
+
+// ロック画面コントロール ID (Phase 2)
+pub(crate) const IDC_LOCK_TITLE: usize = 4001;
+pub(crate) const IDC_LOCK_GUIDE: usize = 4002;
+pub(crate) const IDC_LOCK_PASS_LABEL: usize = 4003;
+pub(crate) const IDC_LOCK_PASS_EDIT: usize = 4004;
+pub(crate) const IDC_LOCK_UNLOCK_BTN: usize = 4005;
+pub(crate) const IDC_LOCK_LOGOUT_BTN: usize = 4006;
+pub(crate) const IDC_LOCK_STATUS: usize = 4007;
 
 pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -437,6 +461,8 @@ fn handle_options_modal(hwnd: HWND) {
             || new_cfg.tcp_port != state.config.tcp_port
             || new_cfg.preferred_nic_ip != state.config.preferred_nic_ip;
         state.config = new_cfg.clone();
+        set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
+        sync_option_menu_checks(handles.hmenu_main, &state.config);
         let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(new_cfg));
         if state.app_state == AppStateKind::LoggedIn {
             if port_or_nic_changed {
@@ -508,9 +534,40 @@ fn handle_manual_peer_modal(hwnd: HWND) {
     }
 }
 
-fn handle_logout_request(hwnd: HWND) {
+fn handle_search_modal(hwnd: HWND) {
     let snapshot = with_state_mut(|s| {
         if s.modal_open || s.app_state != AppStateKind::LoggedIn {
+            return None;
+        }
+        s.modal_open = true;
+        Some((
+            s.log_reader.clone(),
+            s.active_thread.clone(),
+            s.peers.clone(),
+            s.last_search_query.clone(),
+            s.dpi,
+        ))
+    })
+    .flatten();
+    let Some((log_reader, active_thread, peers, last_query, dpi)) = snapshot else {
+        return;
+    };
+
+    let res = show_search_dialog(hwnd, log_reader, active_thread, &peers, &last_query, dpi);
+    with_state_mut(|state| {
+        state.modal_open = false;
+        if state.app_state == AppStateKind::LoggedIn {
+            state.last_search_query = res.last_query;
+        }
+    });
+    if let Some((thread, index)) = res.jump_target {
+        jump_to_search_hit(thread, index);
+    }
+}
+
+fn handle_logout_request(hwnd: HWND) {
+    let snapshot = with_state_mut(|s| {
+        if s.modal_open || !matches!(s.app_state, AppStateKind::LoggedIn | AppStateKind::Locked) {
             return None;
         }
         s.modal_open = true;
@@ -524,7 +581,12 @@ fn handle_logout_request(hwnd: HWND) {
     let confirmed = confirm_logout_or_exit(hwnd, false, dpi);
     let post = with_ui_and_state_mut(|handles, state| {
         state.modal_open = false;
-        if !confirmed || state.app_state != AppStateKind::LoggedIn {
+        if !confirmed
+            || !matches!(
+                state.app_state,
+                AppStateKind::LoggedIn | AppStateKind::Locked
+            )
+        {
             return None;
         }
         match state.cmd_tx.try_send(UiCommand::Logout) {
@@ -543,12 +605,14 @@ fn handle_logout_request(hwnd: HWND) {
             Err(TrySendError::Closed(_)) => {
                 let clear_args = extract_clear_main_args(handles, state);
                 state.app_state = AppStateKind::LoggedOut;
+                remove_tray_icon(hwnd, &mut state.tray_icon_added);
                 state.clear_session_fields();
                 unsafe {
                     SetMenu(hwnd, null_mut());
                     windows_sys::Win32::UI::WindowsAndMessaging::DrawMenuBar(hwnd);
                 }
-                menu_bar::sync_menu_enabled_state(handles.hmenu_main, false);
+                menu_bar::sync_menu_enabled_state(handles.hmenu_main, AppStateKind::LoggedOut);
+                show_lock_controls(handles, false);
                 show_main_controls(handles, false);
                 show_login_controls(handles, true);
                 set_authenticating_ui(handles, false);
@@ -587,9 +651,11 @@ fn handle_exit_request(hwnd: HWND) {
                 unsafe { DestroyWindow(hwnd) };
             }
         }
-        AppStateKind::LoggedIn => {
+        AppStateKind::LoggedIn | AppStateKind::Locked => {
             let reserved = with_state_mut(|s| {
-                if s.modal_open || s.app_state != AppStateKind::LoggedIn {
+                if s.modal_open
+                    || !matches!(s.app_state, AppStateKind::LoggedIn | AppStateKind::Locked)
+                {
                     return false;
                 }
                 s.modal_open = true;
@@ -602,7 +668,12 @@ fn handle_exit_request(hwnd: HWND) {
             let confirmed = confirm_logout_or_exit(hwnd, true, dpi);
             let post = with_ui_and_state_mut(|handles, state| {
                 state.modal_open = false;
-                if !confirmed || state.app_state != AppStateKind::LoggedIn {
+                if !confirmed
+                    || !matches!(
+                        state.app_state,
+                        AppStateKind::LoggedIn | AppStateKind::Locked
+                    )
+                {
                     return None;
                 }
                 match state.cmd_tx.try_send(UiCommand::Shutdown) {
@@ -613,6 +684,7 @@ fn handle_exit_request(hwnd: HWND) {
                     Err(_) => {
                         let args = extract_clear_main_args(handles, state);
                         state.app_state = AppStateKind::Exiting;
+                        remove_tray_icon(hwnd, &mut state.tray_icon_added);
                         state.clear_session_fields();
                         Some((args, true))
                     }
@@ -647,6 +719,12 @@ fn apply_dpi_change(hwnd: HWND, new_dpi: u32, suggested: &RECT) {
                 handles.theme.bold_font as usize,
                 1,
             );
+            SendMessageW(
+                handles.lock_title,
+                WM_SETFONT,
+                handles.theme.bold_font as usize,
+                1,
+            );
             for ctrl in handles.all_ui_font_controls() {
                 SendMessageW(ctrl, WM_SETFONT, handles.theme.ui_font as usize, 1);
             }
@@ -667,6 +745,7 @@ fn apply_dpi_change(hwnd: HWND, new_dpi: u32, suggested: &RECT) {
         let ch = rc.bottom - rc.top;
         layout_login_controls(handles, cw, ch, new_dpi);
         layout_main_controls(handles, cw, ch, new_dpi);
+        layout_lock_controls(handles, cw, ch, new_dpi);
     });
 }
 
@@ -699,7 +778,8 @@ unsafe extern "system" fn main_wnd_proc(
                 apply_window_dwm_attributes(hwnd);
 
                 let menu = create_main_menu_bar();
-                sync_menu_enabled_state(menu.bar, false);
+                sync_menu_enabled_state(menu.bar, AppStateKind::LoggedOut);
+                sync_option_menu_checks(menu.bar, &init_box.config);
 
                 let login_ctrls =
                     create_login_controls(hwnd, hinst, theme.ui_font, theme.bold_font);
@@ -710,6 +790,8 @@ unsafe extern "system" fn main_wnd_proc(
                     theme.bold_font,
                     high_contrast,
                 );
+                let lock_ctrls = create_lock_controls(hwnd, hinst, theme.ui_font, theme.bold_font);
+                set_input_send_on_enter(main_ctrls.input_edit, init_box.config.send_on_enter);
 
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 let hwnd_raw = hwnd as usize;
@@ -753,6 +835,13 @@ unsafe extern "system" fn main_wnd_proc(
                     main_input_edit: main_ctrls.input_edit,
                     main_send_btn: main_ctrls.send_btn,
                     main_statusbar: main_ctrls.statusbar,
+                    lock_title: lock_ctrls.title,
+                    lock_guide: lock_ctrls.guide,
+                    lock_pass_label: lock_ctrls.pass_label,
+                    lock_pass_edit: lock_ctrls.pass_edit,
+                    lock_unlock_btn: lock_ctrls.unlock_btn,
+                    lock_logout_btn: lock_ctrls.logout_btn,
+                    lock_status: lock_ctrls.status,
                 };
                 let state = UiState {
                     app_state: AppStateKind::LoggedOut,
@@ -779,6 +868,12 @@ unsafe extern "system" fn main_wnd_proc(
                     last_focus: handles.login_name_edit,
                     window_alive: init_box.window_alive,
                     multi_instance: init_box.multi_instance,
+                    sound: SoundController::new(),
+                    broadcast_unread_count: 0,
+                    unread_by_peer: HashMap::new(),
+                    last_search_query: Zeroizing::new(String::new()),
+                    auto_away_triggered: false,
+                    tray_icon_added: false,
                 };
                 if let Ok(mut slot) = init_box.join_slot.lock() {
                     *slot = Some(app_handle.join_handle);
@@ -788,9 +883,12 @@ unsafe extern "system" fn main_wnd_proc(
                 GetClientRect(hwnd, &raw mut rc);
                 layout_login_controls(&handles, rc.right - rc.left, rc.bottom - rc.top, dpi);
                 layout_main_controls(&handles, rc.right - rc.left, rc.bottom - rc.top, dpi);
+                layout_lock_controls(&handles, rc.right - rc.left, rc.bottom - rc.top, dpi);
                 show_main_controls(&handles, false);
+                show_lock_controls(&handles, false);
                 show_login_controls(&handles, true);
                 init_thread_locals(handles, state);
+                SetTimer(hwnd, TIMER_AUTO_AWAY, 10_000, None);
                 0
             }
             WM_SIZE => {
@@ -799,7 +897,50 @@ unsafe extern "system" fn main_wnd_proc(
                 with_ui_and_state(|handles, state| {
                     layout_login_controls(handles, cw, ch, state.dpi);
                     layout_main_controls(handles, cw, ch, state.dpi);
+                    layout_lock_controls(handles, cw, ch, state.dpi);
                 });
+                0
+            }
+            WM_TIMER => {
+                if wparam == TIMER_AUTO_AWAY {
+                    let mut lii = LASTINPUTINFO {
+                        cbSize: size_of::<LASTINPUTINFO>() as u32,
+                        dwTime: 0,
+                    };
+                    if GetLastInputInfo(&raw mut lii) != 0 {
+                        let idle_ms = GetTickCount().wrapping_sub(lii.dwTime);
+                        with_ui_and_state_mut(|handles, state| {
+                            if state.app_state != AppStateKind::LoggedIn {
+                                return;
+                            }
+                            let mins = state.config.auto_away_minutes;
+                            if mins == 0 {
+                                return;
+                            }
+                            let threshold_ms = u32::from(mins).saturating_mul(60_000);
+                            if idle_ms >= threshold_ms && state.status == UserStatus::Online {
+                                state.auto_away_triggered = true;
+                                state.status = UserStatus::Away;
+                                sync_status_menu_check(handles.hmenu_status, UserStatus::Away);
+                                update_status_bar(handles, state);
+                                let _ = state
+                                    .cmd_tx
+                                    .try_send(UiCommand::ChangeStatus(UserStatus::Away));
+                            } else if idle_ms < 15_000
+                                && state.auto_away_triggered
+                                && state.status == UserStatus::Away
+                            {
+                                state.auto_away_triggered = false;
+                                state.status = UserStatus::Online;
+                                sync_status_menu_check(handles.hmenu_status, UserStatus::Online);
+                                update_status_bar(handles, state);
+                                let _ = state
+                                    .cmd_tx
+                                    .try_send(UiCommand::ChangeStatus(UserStatus::Online));
+                            }
+                        });
+                    }
+                }
                 0
             }
             WM_GETMINMAXINFO => {
@@ -853,9 +994,15 @@ unsafe extern "system" fn main_wnd_proc(
             }
             WM_ACTIVATE => {
                 if (wparam & 0xFFFF) as u32 != WA_INACTIVE {
-                    let focus_target = with_ui_and_state(|handles, state| {
+                    let focus_target = with_ui_and_state_mut(|handles, state| {
                         if state.modal_open {
                             return None;
+                        }
+                        if state.app_state == AppStateKind::LoggedIn {
+                            let active = state.active_thread.clone();
+                            if clear_unread_for_thread(state, &active) {
+                                refresh_peer_list(handles, state);
+                            }
                         }
                         let cur = GetFocus();
                         if cur.is_null() || cur == hwnd {
@@ -869,6 +1016,7 @@ unsafe extern "system" fn main_wnd_proc(
                                         handles.main_input_edit
                                     }
                                 }
+                                AppStateKind::Locked => handles.lock_pass_edit,
                                 AppStateKind::LoggingOut | AppStateKind::Exiting => null_mut(),
                             })
                         } else {
@@ -926,6 +1074,14 @@ unsafe extern "system" fn main_wnd_proc(
                         send_current_input();
                         return 0;
                     }
+                    IDC_LOCK_UNLOCK_BTN if code == BN_CLICKED => {
+                        submit_unlock();
+                        return 0;
+                    }
+                    IDC_LOCK_LOGOUT_BTN if code == BN_CLICKED => {
+                        handle_logout_request(hwnd);
+                        return 0;
+                    }
                     IDM_STATUS_ONLINE | IDM_STATUS_AWAY | IDM_STATUS_BUSY => {
                         let next_status = match id {
                             IDM_STATUS_AWAY => UserStatus::Away,
@@ -934,11 +1090,49 @@ unsafe extern "system" fn main_wnd_proc(
                         };
                         with_ui_and_state_mut(|handles, state| {
                             if state.app_state == AppStateKind::LoggedIn {
+                                state.auto_away_triggered = false;
                                 state.status = next_status;
                                 sync_status_menu_check(handles.hmenu_status, next_status);
                                 update_status_bar(handles, state);
                                 let _ = state.cmd_tx.try_send(UiCommand::ChangeStatus(next_status));
                             }
+                        });
+                        return 0;
+                    }
+                    IDM_LOCK_SCREEN => {
+                        with_state(|state| {
+                            if state.app_state == AppStateKind::LoggedIn && !state.modal_open {
+                                let _ = state.cmd_tx.try_send(UiCommand::LockScreen);
+                            }
+                        });
+                        return 0;
+                    }
+                    IDM_SEARCH => {
+                        handle_search_modal(hwnd);
+                        return 0;
+                    }
+                    IDM_TOGGLE_SOUND => {
+                        with_ui_and_state_mut(|handles, state| {
+                            if state.app_state == AppStateKind::Locked {
+                                return;
+                            }
+                            state.config.sound_enabled = !state.config.sound_enabled;
+                            let next = state.config.clone();
+                            sync_option_menu_checks(handles.hmenu_main, &next);
+                            let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(next));
+                        });
+                        return 0;
+                    }
+                    IDM_TOGGLE_SEND_ON_ENTER => {
+                        with_ui_and_state_mut(|handles, state| {
+                            if state.app_state == AppStateKind::Locked {
+                                return;
+                            }
+                            state.config.send_on_enter = !state.config.send_on_enter;
+                            let next = state.config.clone();
+                            set_input_send_on_enter(handles.main_input_edit, next.send_on_enter);
+                            sync_option_menu_checks(handles.hmenu_main, &next);
+                            let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(next));
                         });
                         return 0;
                     }
@@ -1083,8 +1277,10 @@ unsafe extern "system" fn main_wnd_proc(
                 0
             }
             WM_DESTROY => {
+                KillTimer(hwnd, TIMER_AUTO_AWAY);
                 with_ui_and_state_mut(|handles, state| {
                     state.window_alive.store(false, Ordering::SeqCst);
+                    remove_tray_icon(hwnd, &mut state.tray_icon_added);
                     remove_main_subclasses(handles);
                     SetMenu(hwnd, null_mut());
                     if !handles.hmenu_main.is_null() {
@@ -1118,9 +1314,10 @@ fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
             handles.login_name_edit,
             handles.login_pass_edit,
             handles.main_chat_list,
+            handles.lock_pass_edit,
         )
     });
-    let Some((app_state, name_edit, pass_edit, chat_list)) = snapshot else {
+    let Some((app_state, name_edit, pass_edit, chat_list, lock_pass_edit)) = snapshot else {
         return false;
     };
 
@@ -1140,8 +1337,32 @@ fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
         }
     }
 
+    if app_state == AppStateKind::Locked {
+        if msg.wParam == usize::from(VK_RETURN) && !ctrl && !shift {
+            let focus = unsafe { GetFocus() };
+            if focus == lock_pass_edit || msg.hwnd == lock_pass_edit {
+                submit_unlock();
+                return true;
+            }
+        }
+        if ctrl && shift && msg.wParam == b'L' as usize {
+            unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_LOGOUT, 0) };
+            return true;
+        }
+        return false;
+    }
+
     if app_state != AppStateKind::LoggedIn {
         return false;
+    }
+
+    if ctrl && !shift && msg.wParam == b'L' as usize {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_LOCK_SCREEN, 0) };
+        return true;
+    }
+    if ctrl && !shift && msg.wParam == b'F' as usize {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEARCH, 0) };
+        return true;
     }
 
     if ctrl && shift && msg.wParam == b'L' as usize {

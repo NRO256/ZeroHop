@@ -13,24 +13,27 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
-use windows_sys::Win32::UI::Controls::EM_SETLIMITTEXT;
+use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DC_HASDEFID, DM_GETDEFID,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_NUMBER, ES_READONLY, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, IDCANCEL,
-    IDOK, IsDialogMessageW, LoadCursorW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostQuitMessage,
-    RegisterClassExW, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowTextW, ShowWindow, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN,
-    WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW,
+    CreateWindowExW, DC_HASDEFID, DM_GETDEFID, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER, ES_READONLY, GWLP_USERDATA,
+    GetMessageW, GetWindowLongPtrW, IDC_ARROW, IDCANCEL, IDOK, IsDialogMessageW, LB_ADDSTRING,
+    LB_GETCURSEL, LB_RESETCONTENT, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LoadCursorW,
+    MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassExW, SW_SHOW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateMessage, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WNDCLASSEXW,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
+    WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use lan_messenger::domain::model::{MAX_MAX_MEMORY_MB, MIN_MAX_MEMORY_MB};
+use lan_messenger::app::coordinator::SessionLogReader;
+use lan_messenger::domain::model::{MAX_MAX_MEMORY_MB, MIN_MAX_MEMORY_MB, PeerView, ThreadKey};
+use lan_messenger::domain::session_log::SearchHit;
 use lan_messenger::domain::validation::{ValidationError, validate_manual_peer_endpoint};
 use lan_messenger::network::nic::{NicCandidate, discover_ipv4_nics};
 use lan_messenger::storage::config::LocalConfig;
@@ -38,7 +41,10 @@ use lan_messenger::storage::paths::AppPaths;
 
 use super::a11y::set_cue_banner;
 use super::theme::{ThemeResources, apply_window_dwm_attributes, center_rect_on_parent, scale_dpi};
-use super::{APP_NAME, APP_VERSION, normalize_crlf, read_window_text, to_wide};
+use super::{
+    APP_NAME, APP_VERSION, format_unix_datetime, normalize_crlf, read_window_text,
+    read_window_text_zeroizing, to_wide,
+};
 
 const MODAL_CLASS_NAME: &str = "LanMessengerModalDialogClass";
 
@@ -57,10 +63,24 @@ const IDC_DLG_OPT_UDP: usize = 4302;
 const IDC_DLG_OPT_TCP: usize = 4303;
 const IDC_DLG_OPT_MEM: usize = 4304;
 const IDC_DLG_OPT_ERR: usize = 4305;
+const IDC_DLG_OPT_AWAY: usize = 4306;
+const IDC_DLG_OPT_SOUND_MASTER: usize = 4307;
+const IDC_DLG_OPT_SOUND_LOGIN: usize = 4308;
+const IDC_DLG_OPT_SOUND_PEER: usize = 4309;
+const IDC_DLG_OPT_SOUND_MSG: usize = 4310;
+const IDC_DLG_OPT_SEND_ENTER: usize = 4311;
+const IDC_DLG_OPT_HIDE_PREVIEW: usize = 4312;
 
 const IDC_DLG_INFO_BODY: usize = 4401;
 const IDC_DLG_INFO_COPY: usize = 4402;
 const IDC_DLG_INFO_STATUS: usize = 4403;
+
+const IDC_DLG_SEARCH_QUERY: usize = 4501;
+const IDC_DLG_SEARCH_CURRENT_ONLY: usize = 4502;
+const IDC_DLG_SEARCH_RUN: usize = 4503;
+const IDC_DLG_SEARCH_LIST: usize = 4504;
+const IDC_DLG_SEARCH_JUMP: usize = 4505;
+const IDC_DLG_SEARCH_STATUS: usize = 4506;
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct DetailDialogInput {
@@ -801,7 +821,52 @@ pub(crate) fn show_add_manual_peer_dialog(
     res.result
 }
 
-// 4. オプション設定ダイアログ（NIC・ポート・メモリ上限）
+// 4. オプション設定ダイアログ（NIC・ポート・メモリ上限・効果音・通知・送信キー・自動離席）
+#[allow(clippy::too_many_arguments)]
+fn create_checkbox(
+    parent: HWND,
+    hinst: HANDLE,
+    font: HFONT,
+    id: usize,
+    text: &str,
+    checked: bool,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> HWND {
+    let cls = to_wide("BUTTON");
+    let txt_w = to_wide(text);
+    unsafe {
+        let hwnd = CreateWindowExW(
+            0,
+            cls.as_ptr(),
+            txt_w.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | (BS_AUTOCHECKBOX as u32),
+            x,
+            y,
+            w,
+            h,
+            parent,
+            id as _,
+            hinst,
+            null_mut(),
+        );
+        SendMessageW(hwnd, WM_SETFONT, font as usize, 1);
+        SendMessageW(
+            hwnd,
+            BM_SETCHECK,
+            if checked { BST_CHECKED } else { BST_UNCHECKED } as usize,
+            0,
+        );
+        hwnd
+    }
+}
+
+fn is_checked(hwnd: HWND) -> bool {
+    unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED as isize }
+}
+
 struct OptionsHandler {
     current_cfg: LocalConfig,
     nics: Vec<NicCandidate>,
@@ -809,6 +874,13 @@ struct OptionsHandler {
     hwnd_udp: HWND,
     hwnd_tcp: HWND,
     hwnd_mem: HWND,
+    hwnd_away: HWND,
+    hwnd_sound_master: HWND,
+    hwnd_sound_login: HWND,
+    hwnd_sound_peer: HWND,
+    hwnd_sound_msg: HWND,
+    hwnd_send_enter: HWND,
+    hwnd_hide_preview: HWND,
     hwnd_err: HWND,
     result: Option<LocalConfig>,
 }
@@ -872,6 +944,24 @@ impl ModalHandler for OptionsHandler {
                 return ModalSignal::Continue;
             }
 
+            let away_str = read_window_text(self.hwnd_away);
+            let Ok(away_mins) = away_str.trim().parse::<u16>() else {
+                let msg = to_wide("自動離席時間は 0〜60 分の数値で指定してください。");
+                unsafe {
+                    SetWindowTextW(self.hwnd_err, msg.as_ptr());
+                    SetFocus(self.hwnd_away);
+                }
+                return ModalSignal::Continue;
+            };
+            if away_mins > 60 {
+                let msg = to_wide("自動離席時間は 0〜60 分の範囲で指定してください。");
+                unsafe {
+                    SetWindowTextW(self.hwnd_err, msg.as_ptr());
+                    SetFocus(self.hwnd_away);
+                }
+                return ModalSignal::Continue;
+            }
+
             let sel = unsafe { SendMessageW(self.hwnd_nic, CB_GETCURSEL, 0, 0) };
             let preferred_nic_ip = if sel > 0 {
                 self.nics.get((sel as usize) - 1).map(|n| n.ip.to_string())
@@ -884,6 +974,13 @@ impl ModalHandler for OptionsHandler {
             next.tcp_port = tcp_port;
             next.max_memory_mb = mem_mb;
             next.preferred_nic_ip = preferred_nic_ip;
+            next.auto_away_minutes = away_mins;
+            next.sound_enabled = is_checked(self.hwnd_sound_master);
+            next.sound_on_login_logout = is_checked(self.hwnd_sound_login);
+            next.sound_on_peer_presence = is_checked(self.hwnd_sound_peer);
+            next.sound_on_message = is_checked(self.hwnd_sound_msg);
+            next.send_on_enter = is_checked(self.hwnd_send_enter);
+            next.hide_notification_preview = is_checked(self.hwnd_hide_preview);
             next.sanitize();
             self.result = Some(next);
             ModalSignal::Close
@@ -914,8 +1011,8 @@ pub(crate) fn show_options_dialog(
     let res = run_modal_dialog(
         parent,
         "オプション設定 - LanMessenger",
-        500,
-        330,
+        520,
+        520,
         dpi,
         |dlg, hinst, ui_font, _| {
             let s = |v| scale_dpi(v, dpi);
@@ -1017,10 +1114,10 @@ pub(crate) fn show_options_dialog(
                 hinst,
                 ui_font,
                 0,
-                "会話ログ総メモリ上限 (4〜32 MiB)(&M):",
+                "会話メモリ上限 (4〜32 MiB)(&M):",
                 s(16),
                 s(134),
-                s(452),
+                s(220),
                 s(20),
             );
             let hwnd_mem = create_edit(
@@ -1036,6 +1133,103 @@ pub(crate) fn show_options_dialog(
                 s(26),
             );
 
+            let _lbl_away = create_static(
+                dlg,
+                hinst,
+                ui_font,
+                0,
+                "自動離席 (分, 0で無効)(&A):",
+                s(240),
+                s(134),
+                s(240),
+                s(20),
+            );
+            let hwnd_away = create_edit(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_AWAY,
+                &cfg_clone.auto_away_minutes.to_string(),
+                (ES_AUTOHSCROLL as u32) | (ES_NUMBER as u32),
+                s(240),
+                s(156),
+                s(120),
+                s(26),
+            );
+
+            let hwnd_sound_master = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_SOUND_MASTER,
+                "効果音・通知音を有効にする(&S)",
+                cfg_clone.sound_enabled,
+                s(16),
+                s(194),
+                s(468),
+                s(22),
+            );
+            let hwnd_sound_login = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_SOUND_LOGIN,
+                "ログイン・ログアウト／終了音を鳴らす",
+                cfg_clone.sound_on_login_logout,
+                s(34),
+                s(220),
+                s(450),
+                s(22),
+            );
+            let hwnd_sound_peer = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_SOUND_PEER,
+                "他ピアの参加・退出音を鳴らす",
+                cfg_clone.sound_on_peer_presence,
+                s(34),
+                s(246),
+                s(450),
+                s(22),
+            );
+            let hwnd_sound_msg = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_SOUND_MSG,
+                "新着メッセージ通知音を鳴らす",
+                cfg_clone.sound_on_message,
+                s(34),
+                s(272),
+                s(450),
+                s(22),
+            );
+            let hwnd_send_enter = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_SEND_ENTER,
+                "Enterキーで送信する (Shift+Enterで改行)(&E)",
+                cfg_clone.send_on_enter,
+                s(16),
+                s(302),
+                s(468),
+                s(22),
+            );
+            let hwnd_hide_preview = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_HIDE_PREVIEW,
+                "新着通知で送信者・本文プレビューを隠す(&P)",
+                cfg_clone.hide_notification_preview,
+                s(16),
+                s(328),
+                s(468),
+                s(22),
+            );
+
             let _lbl_note = create_static(
                 dlg,
                 hinst,
@@ -1043,8 +1237,8 @@ pub(crate) fn show_options_dialog(
                 0,
                 persist_note,
                 s(16),
-                s(192),
-                s(452),
+                s(362),
+                s(472),
                 s(34),
             );
             let hwnd_err = create_static(
@@ -1054,8 +1248,8 @@ pub(crate) fn show_options_dialog(
                 IDC_DLG_OPT_ERR,
                 "",
                 s(16),
-                s(228),
-                s(452),
+                s(402),
+                s(472),
                 s(20),
             );
 
@@ -1064,10 +1258,10 @@ pub(crate) fn show_options_dialog(
                 hinst,
                 ui_font,
                 IDOK as usize,
-                "保存(&S)",
+                "保存(&O)",
                 true,
-                s(258),
-                s(252),
+                s(278),
+                s(436),
                 s(100),
                 s(30),
             );
@@ -1078,8 +1272,8 @@ pub(crate) fn show_options_dialog(
                 IDCANCEL as usize,
                 "キャンセル",
                 false,
-                s(368),
-                s(252),
+                s(388),
+                s(436),
                 s(100),
                 s(30),
             );
@@ -1092,6 +1286,13 @@ pub(crate) fn show_options_dialog(
                     hwnd_udp,
                     hwnd_tcp,
                     hwnd_mem,
+                    hwnd_away,
+                    hwnd_sound_master,
+                    hwnd_sound_login,
+                    hwnd_sound_peer,
+                    hwnd_sound_msg,
+                    hwnd_send_enter,
+                    hwnd_hide_preview,
                     hwnd_err,
                     result: None,
                 },
@@ -1243,21 +1444,24 @@ pub(crate) fn show_shortcuts_dialog(parent: HWND, dpi: u32) {
 [グローバル・メニュー操作]\n\
   Alt + A / E / T / H  : メニューバー各項目を開く\n\
   F6 / Shift+F6        : 接続先リスト / 会話一覧 / メッセージ入力欄を巡回移動\n\
+  Ctrl + F             : セッション内メッセージ検索\n\
+  Ctrl + L             : ワンキー画面ロック（会話・ピア一覧を即時遮蔽）\n\
   Ctrl + M             : 手動ピア追加（IP・ポート指定接続）\n\
   F5                   : ネットワーク再検出（NIC・ソケット再確認）\n\
   Ctrl + Shift + L     : ログアウト確認ダイアログ（全消去）\n\
   Ctrl + Shift + Del   : 現在表示中の会話表示をクリア\n\
   Alt + F4             : 終了（ログイン中は確認後に全消去して終了）\n\
 \n\
-[ログイン画面]\n\
-  Enter                : 表示名・パスワード欄からログイン実行\n\
-  Tab / Shift + Tab    : 入力欄・表示切替・ログイン・オプションを移動\n\
+[ログイン・ロック画面]\n\
+  Enter                : ログインまたは画面ロック解除を実行\n\
+  Tab / Shift + Tab    : 入力欄・表示切替・ボタンを移動\n\
 \n\
 [会話一覧・入力欄]\n\
   上下矢印キー         : 会話メッセージ行または接続先を選択\n\
   Enter（会話一覧上）  : 選択メッセージの全文詳細ダイアログを開く（コピー・再送可）\n\
   Esc（詳細画面上）    : 詳細ダイアログを閉じて直前選択行へフォーカス復帰\n\
-  Ctrl + Enter（入力欄）: メッセージを送信（Enter のみは改行）\n\
+  Ctrl + Enter（入力欄）: 既定設定時のメッセージ送信（Enter のみは改行）\n\
+  Enter（入力欄）      : 「Enterキーで送信」有効時の送信（Shift+Enter で改行、IME変換中は非送信）\n\
   Ctrl + A（入力欄）   : 入力テキストを全選択";
     show_readonly_info_modal(
         parent,
@@ -1265,10 +1469,291 @@ pub(crate) fn show_shortcuts_dialog(parent: HWND, dpi: u32) {
         text,
         false,
         true,
-        620,
-        420,
+        640,
+        460,
         dpi,
     );
+}
+
+// 6. セッション内検索モーダル (Phase 2 Step 2-3)
+pub(crate) struct SearchDialogResult {
+    pub last_query: Zeroizing<String>,
+    pub jump_target: Option<(ThreadKey, usize)>,
+}
+
+struct SearchHandler {
+    log_reader: SessionLogReader,
+    active_thread: ThreadKey,
+    peer_names: Vec<(String, String)>,
+    hwnd_query: HWND,
+    hwnd_current_only: HWND,
+    hwnd_list: HWND,
+    hwnd_status: HWND,
+    hits: Vec<SearchHit>,
+    last_query: Zeroizing<String>,
+    jump_target: Option<(ThreadKey, usize)>,
+}
+
+impl SearchHandler {
+    fn thread_label(&self, thread: &ThreadKey) -> String {
+        match thread {
+            ThreadKey::Broadcast => "全体チャット".to_string(),
+            ThreadKey::Peer(pid) => self
+                .peer_names
+                .iter()
+                .find(|(id, _)| id == pid)
+                .map_or_else(|| pid.clone(), |(_, name)| name.clone()),
+        }
+    }
+
+    fn execute_search(&mut self) {
+        let query = read_window_text_zeroizing(self.hwnd_query);
+        self.last_query = Zeroizing::new(query.to_string());
+        let current_only = is_checked(self.hwnd_current_only);
+        let filter = if current_only {
+            Some(&self.active_thread)
+        } else {
+            None
+        };
+
+        for mut old in self.hits.drain(..) {
+            old.zeroize();
+        }
+        self.hits = self.log_reader.search(filter, &query, 200);
+
+        unsafe {
+            SendMessageW(self.hwnd_list, LB_RESETCONTENT, 0, 0);
+            for hit in &self.hits {
+                let thread_lbl = self.thread_label(&hit.thread);
+                let time_lbl = format_unix_datetime(hit.timestamp);
+                let line = format!(
+                    "[{thread_lbl}] {time_lbl} {}: {}",
+                    hit.sender_name, hit.preview
+                );
+                let line_w = to_wide(&line);
+                SendMessageW(self.hwnd_list, LB_ADDSTRING, 0, line_w.as_ptr() as LPARAM);
+            }
+            let status_msg = if query.trim().is_empty() {
+                "検索キーワードを入力してください。".to_string()
+            } else if self.hits.is_empty() {
+                "一致するメッセージは見つかりませんでした。".to_string()
+            } else {
+                format!(
+                    "{} 件見つかりました（上下キーまたはダブルクリックで移動）。",
+                    self.hits.len()
+                )
+            };
+            let status_w = to_wide(&status_msg);
+            SetWindowTextW(self.hwnd_status, status_w.as_ptr());
+        }
+    }
+
+    fn select_current_and_close(&mut self) -> ModalSignal {
+        let idx = unsafe { SendMessageW(self.hwnd_list, LB_GETCURSEL, 0, 0) };
+        if idx >= 0
+            && let Some(hit) = self.hits.get(idx as usize)
+        {
+            self.jump_target = Some((hit.thread.clone(), hit.index));
+            return ModalSignal::Close;
+        }
+        let msg = to_wide("移動先の検索結果を選択してください。");
+        unsafe { SetWindowTextW(self.hwnd_status, msg.as_ptr()) };
+        ModalSignal::Continue
+    }
+}
+
+impl Drop for SearchHandler {
+    fn drop(&mut self) {
+        for mut h in self.hits.drain(..) {
+            h.zeroize();
+        }
+    }
+}
+
+impl ModalHandler for SearchHandler {
+    fn default_button_id(&self) -> i32 {
+        IDC_DLG_SEARCH_RUN as i32
+    }
+
+    fn on_command(&mut self, _dlg: HWND, id: usize, code: u32) -> ModalSignal {
+        if id == IDC_DLG_SEARCH_LIST && code == LBN_DBLCLK {
+            return self.select_current_and_close();
+        }
+        if code != BN_CLICKED && id != IDOK as usize && id != IDCANCEL as usize {
+            return ModalSignal::Continue;
+        }
+        if id == IDC_DLG_SEARCH_RUN || id == IDOK as usize {
+            self.execute_search();
+            ModalSignal::Continue
+        } else if id == IDC_DLG_SEARCH_JUMP {
+            self.select_current_and_close()
+        } else if id == IDCANCEL as usize {
+            ModalSignal::Close
+        } else {
+            ModalSignal::Continue
+        }
+    }
+}
+
+pub(crate) fn show_search_dialog(
+    parent: HWND,
+    log_reader: SessionLogReader,
+    active_thread: ThreadKey,
+    peers: &[PeerView],
+    initial_query: &str,
+    dpi: u32,
+) -> SearchDialogResult {
+    let peer_names: Vec<(String, String)> = peers
+        .iter()
+        .map(|p| (p.peer_id.clone(), p.display_name.clone()))
+        .collect();
+    let initial_q = initial_query.to_string();
+
+    let mut res = run_modal_dialog(
+        parent,
+        "セッション内メッセージ検索 - LanMessenger",
+        620,
+        430,
+        dpi,
+        |dlg, hinst, ui_font, _| {
+            let s = |v| scale_dpi(v, dpi);
+            let _lbl = create_static(
+                dlg,
+                hinst,
+                ui_font,
+                0,
+                "検索キーワード(&K):",
+                s(16),
+                s(14),
+                s(572),
+                s(20),
+            );
+            let hwnd_query = create_edit(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_SEARCH_QUERY,
+                &initial_q,
+                ES_AUTOHSCROLL as u32,
+                s(16),
+                s(38),
+                s(460),
+                s(26),
+            );
+            set_cue_banner(hwnd_query, "キーワード（送信者名または本文）");
+
+            let _btn_run = create_button(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_SEARCH_RUN,
+                "検索(&S)",
+                true,
+                s(486),
+                s(36),
+                s(102),
+                s(30),
+            );
+
+            let hwnd_current_only = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_SEARCH_CURRENT_ONLY,
+                "現在表示中の会話のみ検索(&T)",
+                false,
+                s(16),
+                s(72),
+                s(572),
+                s(22),
+            );
+
+            let lb_cls = to_wide("LISTBOX");
+            let hwnd_list = unsafe {
+                let h = CreateWindowExW(
+                    WS_EX_CLIENTEDGE,
+                    lb_cls.as_ptr(),
+                    null(),
+                    WS_CHILD
+                        | WS_VISIBLE
+                        | WS_TABSTOP
+                        | WS_VSCROLL
+                        | WS_BORDER
+                        | (LBS_NOTIFY as u32)
+                        | (LBS_NOINTEGRALHEIGHT as u32),
+                    s(16),
+                    s(102),
+                    s(572),
+                    s(210),
+                    dlg,
+                    IDC_DLG_SEARCH_LIST as _,
+                    hinst,
+                    null_mut(),
+                );
+                SendMessageW(h, WM_SETFONT, ui_font as usize, 1);
+                h
+            };
+
+            let hwnd_status = create_static(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_SEARCH_STATUS,
+                "キーワードを入力して「検索」を押してください。",
+                s(16),
+                s(320),
+                s(572),
+                s(20),
+            );
+
+            let _btn_jump = create_button(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_SEARCH_JUMP,
+                "選択位置へ移動(&J)",
+                false,
+                s(340),
+                s(348),
+                s(140),
+                s(30),
+            );
+            let _btn_close = create_button(
+                dlg,
+                hinst,
+                ui_font,
+                IDCANCEL as usize,
+                "閉じる(&C)",
+                false,
+                s(488),
+                s(348),
+                s(100),
+                s(30),
+            );
+
+            let mut handler = SearchHandler {
+                log_reader,
+                active_thread,
+                peer_names,
+                hwnd_query,
+                hwnd_current_only,
+                hwnd_list,
+                hwnd_status,
+                hits: Vec::new(),
+                last_query: Zeroizing::new(initial_q.clone()),
+                jump_target: None,
+            };
+            if !initial_q.trim().is_empty() {
+                handler.execute_search();
+            }
+            (handler, hwnd_query)
+        },
+    );
+
+    SearchDialogResult {
+        last_query: std::mem::take(&mut res.last_query),
+        jump_target: res.jump_target.take(),
+    }
 }
 
 pub(crate) fn show_about_dialog(parent: HWND, dpi: u32) {

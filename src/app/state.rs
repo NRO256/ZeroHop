@@ -11,6 +11,7 @@ pub enum AppStateKind {
     LoggedOut,
     Authenticating,
     LoggedIn,
+    Locked,
     LoggingOut,
     Exiting,
 }
@@ -30,11 +31,16 @@ pub fn can_transition(from: AppStateKind, to: AppStateKind) -> bool {
                 | AppStateKind::LoggedIn
                 | AppStateKind::LoggingOut
                 | AppStateKind::Exiting
-        ) | (AppStateKind::LoggedIn, AppStateKind::LoggingOut)
-            | (
-                AppStateKind::LoggingOut,
-                AppStateKind::LoggedOut | AppStateKind::Exiting
-            )
+        ) | (
+            AppStateKind::LoggedIn,
+            AppStateKind::Locked | AppStateKind::LoggingOut
+        ) | (
+            AppStateKind::Locked,
+            AppStateKind::LoggedIn | AppStateKind::LoggingOut
+        ) | (
+            AppStateKind::LoggingOut,
+            AppStateKind::LoggedOut | AppStateKind::Exiting
+        )
     )
 }
 
@@ -62,6 +68,10 @@ pub enum UiCommand {
         thread: Option<ThreadKey>,
     },
     UpdateConfig(LocalConfig),
+    LockScreen,
+    UnlockScreen {
+        password: Zeroizing<String>,
+    },
     Logout,
     Shutdown,
 }
@@ -97,6 +107,11 @@ impl fmt::Debug for UiCommand {
                 .field("thread", thread)
                 .finish(),
             Self::UpdateConfig(cfg) => f.debug_tuple("UpdateConfig").field(cfg).finish(),
+            Self::LockScreen => f.write_str("LockScreen"),
+            Self::UnlockScreen { .. } => f
+                .debug_struct("UnlockScreen")
+                .field("password", &"[REDACTED]")
+                .finish(),
             Self::Logout => f.write_str("Logout"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
@@ -129,6 +144,15 @@ pub enum AppEvent {
         thread: ThreadKey,
         new_count: usize,
         total_log_bytes: usize,
+    },
+    IncomingMessageReceived {
+        thread: ThreadKey,
+        sender_name: String,
+        preview: String,
+    },
+    ScreenLocked,
+    ScreenUnlockResult {
+        ok: bool,
     },
     DeliveryUpdated {
         thread: ThreadKey,
@@ -176,6 +200,16 @@ mod tests {
         ));
         assert!(!can_transition(
             AppStateKind::LoggedIn,
+            AppStateKind::LoggedOut
+        ));
+        assert!(can_transition(AppStateKind::LoggedIn, AppStateKind::Locked));
+        assert!(can_transition(AppStateKind::Locked, AppStateKind::LoggedIn));
+        assert!(can_transition(
+            AppStateKind::Locked,
+            AppStateKind::LoggingOut
+        ));
+        assert!(!can_transition(
+            AppStateKind::Locked,
             AppStateKind::LoggedOut
         ));
         assert!(can_transition(

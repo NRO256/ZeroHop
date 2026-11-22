@@ -2,6 +2,8 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{HFONT, InvalidateRect};
@@ -13,15 +15,23 @@ use windows_sys::Win32::UI::Controls::{
     LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
     LVSICF_NOSCROLL, NMLVDISPINFOW, SB_SETPARTS, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_RETURN};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetKeyState, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
+};
+use windows_sys::Win32::UI::Shell::{
+    DefSubclassProc, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, RemoveWindowSubclass, SetWindowSubclass,
+    Shell_NotifyIconW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CreateWindowExW, DLGC_WANTMESSAGE, DestroyWindow, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, ES_WANTRETURN, LB_ADDSTRING, LB_GETCURSEL,
-    LB_RESETCONTENT, LB_SETCURSEL, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MSG, MoveWindow, PostMessageW,
-    SW_HIDE, SW_SHOW, SendMessageW, SetMenu, SetWindowTextW, ShowWindow, WM_CHAR, WM_GETDLGCODE,
-    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_SETFONT,
-    WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW, DLGC_WANTMESSAGE, DestroyWindow,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY, ES_WANTRETURN,
+    FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GetForegroundWindow, IDI_APPLICATION,
+    IsIconic, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBS_NOINTEGRALHEIGHT,
+    LBS_NOTIFY, LoadIconW, MSG, MoveWindow, PostMessageW, SW_HIDE, SW_SHOW, SendMessageW, SetMenu,
+    SetWindowTextW, ShowWindow, WM_CHAR, WM_GETDLGCODE, WM_IME_ENDCOMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_SETFONT, WS_BORDER, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 use zeroize::Zeroizing;
 
@@ -30,26 +40,47 @@ use lan_messenger::domain::model::{MAX_MESSAGES_PER_THREAD, ThreadKey};
 use lan_messenger::domain::validation::validate_chat_body;
 
 use super::a11y::{
-    focus_control, focus_listview_item, get_selected_listview_index, set_cue_banner,
+    focus_control, focus_listview_item, get_selected_listview_index, safe_disable_window,
+    set_cue_banner,
 };
 use super::dialogs::{DetailDialogAction, DetailDialogInput, show_message_detail_dialog};
 use super::login_view::{
     reset_login_form, set_authenticating_ui, set_login_status_message, show_login_controls,
 };
-use super::menu_bar::{sync_menu_enabled_state, sync_status_menu_check};
-use super::state_helpers::{UiHandles, UiState, with_state, with_ui, with_ui_and_state_mut};
+use super::menu_bar::{sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check};
+use super::sound::{SoundEvent, play_logout_on_exit_sync, play_sound_if_allowed};
+use super::state_helpers::{
+    UiHandles, UiState, with_state, with_state_mut, with_ui, with_ui_and_state_mut,
+};
 use super::theme::{apply_listview_explorer_theme, scale_dpi};
 use super::{
-    IDC_MAIN_BYTE_GUIDE, IDC_MAIN_CHAT_LIST, IDC_MAIN_INPUT_EDIT, IDC_MAIN_NOTICE,
-    IDC_MAIN_PEER_LABEL, IDC_MAIN_PEER_LIST, IDC_MAIN_SEND_BTN, IDC_MAIN_STATUSBAR,
-    IDC_MAIN_THREAD_HEADER, WM_APP_OPEN_DETAIL, format_bytes_human, format_remaining_bytes_label,
-    format_unix_datetime, format_unix_time_hms, is_message_retryable, normalized_utf8_byte_len,
+    IDC_LOCK_GUIDE, IDC_LOCK_LOGOUT_BTN, IDC_LOCK_PASS_EDIT, IDC_LOCK_PASS_LABEL, IDC_LOCK_STATUS,
+    IDC_LOCK_TITLE, IDC_LOCK_UNLOCK_BTN, IDC_MAIN_BYTE_GUIDE, IDC_MAIN_CHAT_LIST,
+    IDC_MAIN_INPUT_EDIT, IDC_MAIN_NOTICE, IDC_MAIN_PEER_LABEL, IDC_MAIN_PEER_LIST,
+    IDC_MAIN_SEND_BTN, IDC_MAIN_STATUSBAR, IDC_MAIN_THREAD_HEADER, WM_APP_OPEN_DETAIL,
+    WM_APP_TRAY_CALLBACK, format_bytes_human, format_remaining_bytes_label, format_unix_datetime,
+    format_unix_time_hms, is_message_retryable, normalized_utf8_byte_len,
     read_window_text_zeroizing, resolve_migrated_thread, summarize_message_body, to_wide,
     write_utf16_buf,
 };
 
 const SUBCLASS_ID_CHAT_LIST: usize = 201;
 const SUBCLASS_ID_INPUT_EDIT: usize = 202;
+const TRAY_ICON_ID: u32 = 1;
+
+static INPUT_SEND_ON_ENTER: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_input_send_on_enter(hwnd_input: HWND, enabled: bool) {
+    INPUT_SEND_ON_ENTER.store(enabled, Ordering::Relaxed);
+    if !hwnd_input.is_null() {
+        let cue = if enabled {
+            "メッセージを入力 (Enter で送信 / Shift+Enter で改行)"
+        } else {
+            "メッセージを入力 (Ctrl+Enter で送信)"
+        };
+        set_cue_banner(hwnd_input, cue);
+    }
+}
 
 pub(crate) struct MainControlHandles {
     pub peer_label: HWND,
@@ -156,27 +187,50 @@ unsafe extern "system" fn input_edit_subclass_proc(
     ref_data: usize,
 ) -> LRESULT {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
-        static IME_COMPOSING: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        static SUPPRESS_NEXT_LF: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static IME_COMPOSING: AtomicBool = AtomicBool::new(false);
+        static SUPPRESS_NEXT_LF: AtomicBool = AtomicBool::new(false);
+        static SUPPRESS_NEXT_CR: AtomicBool = AtomicBool::new(false);
 
         match msg {
             WM_IME_STARTCOMPOSITION => {
-                IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
+                IME_COMPOSING.store(true, Ordering::Relaxed);
             }
             WM_IME_ENDCOMPOSITION => {
-                IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+                IME_COMPOSING.store(false, Ordering::Relaxed);
             }
             WM_KILLFOCUS => {
-                IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
-                SUPPRESS_NEXT_LF.store(false, std::sync::atomic::Ordering::Relaxed);
+                IME_COMPOSING.store(false, Ordering::Relaxed);
+                SUPPRESS_NEXT_LF.store(false, Ordering::Relaxed);
+                SUPPRESS_NEXT_CR.store(false, Ordering::Relaxed);
             }
             WM_KEYDOWN => {
                 let ctrl_down = (GetKeyState(i32::from(VK_CONTROL)) as u16 & 0x8000) != 0;
-                if ctrl_down && wparam == usize::from(VK_RETURN) {
-                    SUPPRESS_NEXT_LF.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if !IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
+                let shift_down = (GetKeyState(i32::from(VK_SHIFT)) as u16 & 0x8000) != 0;
+                let alt_down = (GetKeyState(i32::from(VK_MENU)) as u16 & 0x8000) != 0;
+                let send_on_enter = INPUT_SEND_ON_ENTER.load(Ordering::Relaxed);
+                let is_composing = IME_COMPOSING.load(Ordering::Relaxed);
+
+                if wparam == usize::from(VK_RETURN) {
+                    if !send_on_enter && ctrl_down && !alt_down {
+                        SUPPRESS_NEXT_LF.store(true, Ordering::Relaxed);
+                        if !is_composing {
+                            let parent = ref_data as HWND;
+                            if !parent.is_null() {
+                                PostMessageW(
+                                    parent,
+                                    windows_sys::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                                    IDC_MAIN_SEND_BTN,
+                                    hwnd as LPARAM,
+                                );
+                            }
+                        }
+                        return 0;
+                    }
+                    if send_on_enter && !ctrl_down && !shift_down && !alt_down {
+                        if is_composing {
+                            return DefSubclassProc(hwnd, msg, wparam, lparam);
+                        }
+                        SUPPRESS_NEXT_CR.store(true, Ordering::Relaxed);
                         let parent = ref_data as HWND;
                         if !parent.is_null() {
                             PostMessageW(
@@ -186,8 +240,8 @@ unsafe extern "system" fn input_edit_subclass_proc(
                                 hwnd as LPARAM,
                             );
                         }
+                        return 0;
                     }
-                    return 0;
                 }
                 if ctrl_down && wparam == b'A' as usize {
                     SendMessageW(hwnd, EM_SETSEL, 0, -1);
@@ -195,12 +249,14 @@ unsafe extern "system" fn input_edit_subclass_proc(
                 }
             }
             WM_KEYUP if wparam == usize::from(VK_RETURN) => {
-                SUPPRESS_NEXT_LF.store(false, std::sync::atomic::Ordering::Relaxed);
+                SUPPRESS_NEXT_LF.store(false, Ordering::Relaxed);
+                SUPPRESS_NEXT_CR.store(false, Ordering::Relaxed);
             }
             WM_CHAR => {
-                if wparam == 0x0A
-                    && SUPPRESS_NEXT_LF.swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
+                if wparam == 0x0A && SUPPRESS_NEXT_LF.swap(false, Ordering::Relaxed) {
+                    return 0;
+                }
+                if wparam == 0x0D && SUPPRESS_NEXT_CR.swap(false, Ordering::Relaxed) {
                     return 0;
                 }
                 let ctrl_down = (GetKeyState(i32::from(VK_CONTROL)) as u16 & 0x8000) != 0;
@@ -490,6 +546,222 @@ pub(crate) fn layout_main_controls(handles: &UiHandles, client_w: i32, client_h:
     }
 }
 
+pub(crate) struct LockControlHandles {
+    pub title: HWND,
+    pub guide: HWND,
+    pub pass_label: HWND,
+    pub pass_edit: HWND,
+    pub unlock_btn: HWND,
+    pub logout_btn: HWND,
+    pub status: HWND,
+}
+
+pub(crate) fn create_lock_controls(
+    hwnd_parent: HWND,
+    hinst: windows_sys::Win32::Foundation::HANDLE,
+    ui_font: HFONT,
+    title_font: HFONT,
+) -> LockControlHandles {
+    let static_w = to_wide("STATIC");
+    let edit_w = to_wide("EDIT");
+    let button_w = to_wide("BUTTON");
+    let static_style = WS_CHILD | SS_LEFT | SS_NOPREFIX;
+
+    let title = make_ctrl(
+        hwnd_parent,
+        hinst,
+        static_w.as_ptr(),
+        "画面ロック中 - LanMessenger",
+        0,
+        static_style,
+        IDC_LOCK_TITLE,
+        title_font,
+    );
+    let guide = make_ctrl(
+        hwnd_parent,
+        hinst,
+        static_w.as_ptr(),
+        "会話内容と接続先一覧を非表示にしています。ルームパスワードを再入力してロックを解除してください。",
+        0,
+        static_style,
+        IDC_LOCK_GUIDE,
+        ui_font,
+    );
+    let pass_label = make_ctrl(
+        hwnd_parent,
+        hinst,
+        static_w.as_ptr(),
+        "パスワード(&P):",
+        0,
+        static_style,
+        IDC_LOCK_PASS_LABEL,
+        ui_font,
+    );
+    let pass_edit = make_ctrl(
+        hwnd_parent,
+        hinst,
+        edit_w.as_ptr(),
+        "",
+        WS_EX_CLIENTEDGE,
+        WS_CHILD | WS_TABSTOP | (ES_AUTOHSCROLL as u32) | (ES_PASSWORD as u32),
+        IDC_LOCK_PASS_EDIT,
+        ui_font,
+    );
+    unsafe {
+        SendMessageW(pass_edit, EM_SETLIMITTEXT, 256, 0);
+    }
+    set_cue_banner(pass_edit, "ログイン時のパスワードを入力");
+
+    let unlock_btn = make_ctrl(
+        hwnd_parent,
+        hinst,
+        button_w.as_ptr(),
+        "ロック解除(&U)",
+        0,
+        WS_CHILD | WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
+        IDC_LOCK_UNLOCK_BTN,
+        ui_font,
+    );
+    let logout_btn = make_ctrl(
+        hwnd_parent,
+        hinst,
+        button_w.as_ptr(),
+        "ログアウトして全消去(&L)",
+        0,
+        WS_CHILD | WS_TABSTOP | (BS_PUSHBUTTON as u32),
+        IDC_LOCK_LOGOUT_BTN,
+        ui_font,
+    );
+    let status = make_ctrl(
+        hwnd_parent,
+        hinst,
+        static_w.as_ptr(),
+        "",
+        0,
+        static_style,
+        IDC_LOCK_STATUS,
+        ui_font,
+    );
+
+    LockControlHandles {
+        title,
+        guide,
+        pass_label,
+        pass_edit,
+        unlock_btn,
+        logout_btn,
+        status,
+    }
+}
+
+pub(crate) fn layout_lock_controls(handles: &UiHandles, client_w: i32, client_h: i32, dpi: u32) {
+    let s = |v| scale_dpi(v, dpi);
+    let card_w = s(440).min((client_w - s(48)).max(s(280)));
+    let x = ((client_w - card_w) / 2).max(s(20));
+    let mut y = ((client_h - s(240)) / 2).max(s(28));
+
+    unsafe {
+        MoveWindow(handles.lock_title, x, y, card_w, s(32), 1);
+        y += s(40);
+        MoveWindow(handles.lock_guide, x, y, card_w, s(40), 1);
+        y += s(48);
+        MoveWindow(handles.lock_pass_label, x, y, card_w, s(20), 1);
+        y += s(24);
+        MoveWindow(handles.lock_pass_edit, x, y, card_w, s(28), 1);
+        y += s(40);
+        let btn_w = s(160);
+        MoveWindow(handles.lock_unlock_btn, x, y, btn_w, s(32), 1);
+        MoveWindow(
+            handles.lock_logout_btn,
+            x + btn_w + s(12),
+            y,
+            s(200),
+            s(32),
+            1,
+        );
+        y += s(42);
+        MoveWindow(handles.lock_status, x, y, card_w, s(36), 1);
+    }
+}
+
+pub(crate) fn show_lock_controls(handles: &UiHandles, visible: bool) {
+    let cmd = if visible { SW_SHOW } else { SW_HIDE };
+    unsafe {
+        for hwnd in handles.lock_controls() {
+            ShowWindow(hwnd, cmd);
+        }
+    }
+}
+
+pub(crate) fn submit_unlock() {
+    enum UnlockPrep {
+        FocusPass(HWND),
+        Ready {
+            pass_edit: HWND,
+            unlock_btn: HWND,
+            logout_btn: HWND,
+            status: HWND,
+            cmd_tx: tokio::sync::mpsc::Sender<UiCommand>,
+            password: Zeroizing<String>,
+        },
+    }
+
+    let prep = with_ui_and_state_mut(|handles, state| {
+        if state.app_state != AppStateKind::Locked {
+            return None;
+        }
+        let password = read_window_text_zeroizing(handles.lock_pass_edit);
+        if password.is_empty() {
+            let msg = to_wide("パスワードを入力してください。");
+            unsafe { SetWindowTextW(handles.lock_status, msg.as_ptr()) };
+            return Some(UnlockPrep::FocusPass(handles.lock_pass_edit));
+        }
+        Some(UnlockPrep::Ready {
+            pass_edit: handles.lock_pass_edit,
+            unlock_btn: handles.lock_unlock_btn,
+            logout_btn: handles.lock_logout_btn,
+            status: handles.lock_status,
+            cmd_tx: state.cmd_tx.clone(),
+            password,
+        })
+    })
+    .flatten();
+
+    match prep {
+        Some(UnlockPrep::FocusPass(pass_edit)) => {
+            focus_control(pass_edit);
+        }
+        Some(UnlockPrep::Ready {
+            pass_edit,
+            unlock_btn,
+            logout_btn,
+            status,
+            cmd_tx,
+            password,
+        }) => {
+            let checking = to_wide("パスワードを検証しています...");
+            unsafe {
+                SetWindowTextW(status, checking.as_ptr());
+                safe_disable_window(unlock_btn, logout_btn);
+                EnableWindow(pass_edit, 0);
+            }
+            if cmd_tx
+                .try_send(UiCommand::UnlockScreen { password })
+                .is_err()
+            {
+                let err_w = to_wide("検証要求を送信できませんでした。");
+                unsafe {
+                    EnableWindow(pass_edit, 1);
+                    EnableWindow(unlock_btn, 1);
+                    SetWindowTextW(status, err_w.as_ptr());
+                }
+                focus_control(pass_edit);
+            }
+        }
+        None => {}
+    }
+}
+
 pub(crate) fn show_main_controls(handles: &UiHandles, visible: bool) {
     let cmd = if visible { SW_SHOW } else { SW_HIDE };
     unsafe {
@@ -582,14 +854,52 @@ pub(crate) fn update_status_bar(handles: &UiHandles, state: &UiState) {
     }
 }
 
+pub(crate) fn clear_unread_for_thread(state: &mut UiState, thread: &ThreadKey) -> bool {
+    match thread {
+        ThreadKey::Broadcast => {
+            let had = state.broadcast_unread_count > 0;
+            state.broadcast_unread_count = 0;
+            had
+        }
+        ThreadKey::Peer(pid) => {
+            let removed = state.unread_by_peer.remove(pid).unwrap_or(0) > 0;
+            for p in &mut state.peers {
+                if &p.peer_id == pid {
+                    p.unread_count = 0;
+                }
+            }
+            removed
+        }
+    }
+}
+
 pub(crate) fn refresh_peer_list(handles: &UiHandles, state: &mut UiState) -> bool {
     let migrated = resolve_migrated_thread(&state.active_thread, &state.peers);
     let thread_changed = migrated != state.active_thread;
+    if thread_changed
+        && let ThreadKey::Peer(old_pid) = &state.active_thread
+        && let ThreadKey::Peer(new_pid) = &migrated
+        && let Some(cnt) = state.unread_by_peer.remove(old_pid)
+    {
+        *state.unread_by_peer.entry(new_pid.clone()).or_insert(0) += cnt;
+    }
     state.active_thread = migrated;
+
+    state
+        .unread_by_peer
+        .retain(|pid, _| state.peers.iter().any(|p| &p.peer_id == pid));
+    for p in &mut state.peers {
+        p.unread_count = state.unread_by_peer.get(&p.peer_id).copied().unwrap_or(0);
+    }
 
     unsafe {
         SendMessageW(handles.main_peer_list, LB_RESETCONTENT, 0, 0);
-        let broadcast_label = to_wide("全体チャット（全員）");
+        let broadcast_text = if state.broadcast_unread_count > 0 {
+            format!("全体チャット（全員） ({})", state.broadcast_unread_count)
+        } else {
+            "全体チャット（全員）".to_string()
+        };
+        let broadcast_label = to_wide(&broadcast_text);
         SendMessageW(
             handles.main_peer_list,
             LB_ADDSTRING,
@@ -763,11 +1073,15 @@ pub(crate) fn handle_peer_list_selchange() {
         } else {
             ThreadKey::Broadcast
         };
+        let cleared = clear_unread_for_thread(state, &next_thread);
         if next_thread != state.active_thread {
             state.active_thread = next_thread;
             state.last_lv_count = 0;
-            update_thread_header(handles, state);
+            refresh_peer_list(handles, state);
             Some(prepare_virtual_listview_sync(handles, state, true))
+        } else if cleared {
+            refresh_peer_list(handles, state);
+            None
         } else {
             None
         }
@@ -776,6 +1090,98 @@ pub(crate) fn handle_peer_list_selchange() {
 
     if let Some(args) = sync_args {
         apply_virtual_listview_sync(args);
+    }
+}
+
+pub(crate) fn jump_to_search_hit(thread: ThreadKey, index: usize) {
+    let post = with_ui_and_state_mut(|handles, state| {
+        if state.app_state != AppStateKind::LoggedIn {
+            return None;
+        }
+        clear_unread_for_thread(state, &thread);
+        if state.active_thread != thread {
+            state.active_thread = thread;
+            state.last_lv_count = 0;
+        }
+        refresh_peer_list(handles, state);
+        let lv = prepare_virtual_listview_sync(handles, state, false);
+        Some((lv, handles.main_chat_list))
+    })
+    .flatten();
+
+    if let Some((lv, hwnd_lv)) = post {
+        apply_virtual_listview_sync(lv);
+        focus_control(hwnd_lv);
+        focus_listview_item(hwnd_lv, index);
+    }
+}
+
+pub(crate) fn is_window_foreground(hwnd: HWND) -> bool {
+    unsafe { GetForegroundWindow() == hwnd && IsIconic(hwnd) == 0 }
+}
+
+pub(crate) fn remove_tray_icon(hwnd: HWND, tray_icon_added: &mut bool) {
+    if !*tray_icon_added || hwnd.is_null() {
+        return;
+    }
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ICON_ID;
+    unsafe {
+        Shell_NotifyIconW(NIM_DELETE, &raw const nid);
+    }
+    *tray_icon_added = false;
+}
+
+fn show_balloon_notification(hwnd: HWND, tray_icon_added: &mut bool, title: &str, body: &str) {
+    if hwnd.is_null() {
+        return;
+    }
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ICON_ID;
+    nid.uCallbackMessage = WM_APP_TRAY_CALLBACK;
+
+    if !*tray_icon_added {
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+        write_utf16_buf(
+            nid.szTip.as_mut_ptr(),
+            nid.szTip.len() as i32,
+            "LanMessenger",
+        );
+        unsafe {
+            if Shell_NotifyIconW(NIM_ADD, &raw const nid) != 0 {
+                *tray_icon_added = true;
+            }
+        }
+    }
+
+    if *tray_icon_added {
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+        write_utf16_buf(
+            nid.szInfoTitle.as_mut_ptr(),
+            nid.szInfoTitle.len() as i32,
+            title,
+        );
+        write_utf16_buf(nid.szInfo.as_mut_ptr(), nid.szInfo.len() as i32, body);
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &raw const nid);
+        }
+    }
+
+    let fw = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd,
+        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        uCount: 3,
+        dwTimeout: 0,
+    };
+    unsafe {
+        FlashWindowEx(&raw const fw);
     }
 }
 
@@ -987,18 +1393,28 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     set_authenticating_ui(handles, false);
                     reset_login_form(handles, false);
                     show_login_controls(handles, false);
+                    show_lock_controls(handles, false);
                     unsafe {
                         SetMenu(hwnd, handles.hmenu_main);
                         windows_sys::Win32::UI::WindowsAndMessaging::DrawMenuBar(hwnd);
                     }
-                    sync_menu_enabled_state(handles.hmenu_main, true);
+                    sync_menu_enabled_state(handles.hmenu_main, AppStateKind::LoggedIn);
                     sync_status_menu_check(handles.hmenu_status, state.status);
+                    sync_option_menu_checks(handles.hmenu_main, &state.config);
+                    set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
                     show_main_controls(handles, true);
                     refresh_peer_list(handles, state);
                     let lv = prepare_virtual_listview_sync(handles, state, true);
                     update_input_byte_guide(handles);
                     set_notice_text(handles, state, "");
                     state.last_focus = handles.main_input_edit;
+                    state.sound.mark_login_at(Instant::now());
+                    play_sound_if_allowed(
+                        &mut state.sound,
+                        SoundEvent::Login,
+                        &state.config,
+                        false,
+                    );
                     (lv, handles.main_input_edit)
                 });
                 if let Some((lv, focus_target)) = post {
@@ -1019,10 +1435,17 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
             }
             AppEvent::PeerListChanged(new_peers) => {
                 let lv_opt = with_ui_and_state_mut(|handles, state| {
-                    if state.app_state != AppStateKind::LoggedIn || state.peers == new_peers {
+                    if !matches!(
+                        state.app_state,
+                        AppStateKind::LoggedIn | AppStateKind::Locked
+                    ) || state.peers == new_peers
+                    {
                         return None;
                     }
                     state.peers = new_peers;
+                    if state.app_state == AppStateKind::Locked {
+                        return None;
+                    }
                     let thread_changed = refresh_peer_list(handles, state);
                     if thread_changed {
                         state.last_lv_count = 0;
@@ -1036,7 +1459,162 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     apply_virtual_listview_sync(lv);
                 }
             }
-            AppEvent::PeerJoined { .. } | AppEvent::PeerLeft { .. } => {}
+            AppEvent::PeerJoined { .. } => {
+                with_state_mut(|state| {
+                    let is_locked = state.app_state == AppStateKind::Locked;
+                    play_sound_if_allowed(
+                        &mut state.sound,
+                        SoundEvent::PeerJoined,
+                        &state.config,
+                        is_locked,
+                    );
+                });
+            }
+            AppEvent::PeerLeft { .. } => {
+                with_state_mut(|state| {
+                    let is_locked = state.app_state == AppStateKind::Locked;
+                    play_sound_if_allowed(
+                        &mut state.sound,
+                        SoundEvent::PeerLeft,
+                        &state.config,
+                        is_locked,
+                    );
+                });
+            }
+            AppEvent::IncomingMessageReceived {
+                thread,
+                sender_name,
+                preview,
+            } => {
+                with_ui_and_state_mut(|handles, state| {
+                    if !matches!(
+                        state.app_state,
+                        AppStateKind::LoggedIn | AppStateKind::Locked
+                    ) {
+                        return;
+                    }
+                    let is_locked = state.app_state == AppStateKind::Locked;
+                    let fg = !is_locked && is_window_foreground(hwnd);
+                    let is_active_fg = fg && state.active_thread == thread;
+
+                    if !is_active_fg {
+                        match &thread {
+                            ThreadKey::Broadcast => {
+                                state.broadcast_unread_count =
+                                    state.broadcast_unread_count.saturating_add(1);
+                            }
+                            ThreadKey::Peer(pid) => {
+                                let cnt = state.unread_by_peer.entry(pid.clone()).or_insert(0);
+                                *cnt = cnt.saturating_add(1);
+                            }
+                        }
+                    }
+
+                    if !is_locked {
+                        refresh_peer_list(handles, state);
+                        play_sound_if_allowed(
+                            &mut state.sound,
+                            SoundEvent::MessageReceived,
+                            &state.config,
+                            false,
+                        );
+                        if !fg {
+                            let (title, body) = if state.config.hide_notification_preview {
+                                (
+                                    "LanMessenger".to_string(),
+                                    "新着メッセージがあります".to_string(),
+                                )
+                            } else {
+                                (format!("新着メッセージ: {sender_name}"), preview)
+                            };
+                            show_balloon_notification(
+                                hwnd,
+                                &mut state.tray_icon_added,
+                                &title,
+                                &body,
+                            );
+                        }
+                    }
+                });
+            }
+            AppEvent::ScreenLocked => {
+                let post = with_ui_and_state_mut(|handles, state| {
+                    state.app_state = AppStateKind::Locked;
+                    remove_tray_icon(hwnd, &mut state.tray_icon_added);
+                    show_main_controls(handles, false);
+                    sync_menu_enabled_state(handles.hmenu_main, AppStateKind::Locked);
+                    unsafe {
+                        let empty = to_wide("");
+                        SetWindowTextW(handles.lock_pass_edit, empty.as_ptr());
+                        SetWindowTextW(handles.lock_status, empty.as_ptr());
+                        EnableWindow(handles.lock_pass_edit, 1);
+                        EnableWindow(handles.lock_unlock_btn, 1);
+                        EnableWindow(handles.lock_logout_btn, 1);
+                    }
+                    show_lock_controls(handles, true);
+                    state.last_lv_count = 0;
+                    state.last_focus = handles.lock_pass_edit;
+                    (
+                        super::main_view::LvSyncArgs {
+                            hwnd_lv: handles.main_chat_list,
+                            prev_count: 0,
+                            new_count: 0,
+                            allow_autoscroll: false,
+                        },
+                        handles.lock_pass_edit,
+                    )
+                });
+                if let Some((lv, focus_target)) = post {
+                    apply_virtual_listview_sync(lv);
+                    focus_control(focus_target);
+                }
+            }
+            AppEvent::ScreenUnlockResult { ok } => {
+                if ok {
+                    let post = with_ui_and_state_mut(|handles, state| {
+                        state.app_state = AppStateKind::LoggedIn;
+                        unsafe {
+                            let empty = to_wide("");
+                            SetWindowTextW(handles.lock_pass_edit, empty.as_ptr());
+                            SetWindowTextW(handles.lock_status, empty.as_ptr());
+                        }
+                        show_lock_controls(handles, false);
+                        sync_menu_enabled_state(handles.hmenu_main, AppStateKind::LoggedIn);
+                        show_main_controls(handles, true);
+                        let active_clone = state.active_thread.clone();
+                        clear_unread_for_thread(state, &active_clone);
+                        refresh_peer_list(handles, state);
+                        let lv = prepare_virtual_listview_sync(handles, state, true);
+                        state.last_focus = handles.main_input_edit;
+                        (lv, handles.main_input_edit)
+                    });
+                    if let Some((lv, focus_target)) = post {
+                        apply_virtual_listview_sync(lv);
+                        focus_control(focus_target);
+                    }
+                } else {
+                    let target = with_ui_and_state_mut(|handles, state| {
+                        if state.app_state != AppStateKind::Locked {
+                            return None;
+                        }
+                        let msg = to_wide(
+                            "パスワードが一致しません。再入力するか「ログアウトして全消去」を選択してください。",
+                        );
+                        unsafe {
+                            EnableWindow(handles.lock_pass_edit, 1);
+                            EnableWindow(handles.lock_unlock_btn, 1);
+                            EnableWindow(handles.lock_logout_btn, 1);
+                            SetWindowTextW(handles.lock_status, msg.as_ptr());
+                            SendMessageW(handles.lock_pass_edit, EM_SETSEL, 0, -1);
+                        }
+                        Some(handles.lock_pass_edit)
+                    })
+                    .flatten();
+                    if let Some(hwnd_pass) = target {
+                        focus_control(hwnd_pass);
+                    }
+                }
+            }
             AppEvent::ThreadUpdated {
                 thread,
                 total_log_bytes,
@@ -1169,14 +1747,26 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
             }
             AppEvent::LogoutCompleted => {
                 let post = with_ui_and_state_mut(|handles, state| {
+                    let was_locked = state.app_state == AppStateKind::Locked;
+                    play_sound_if_allowed(
+                        &mut state.sound,
+                        SoundEvent::Logout,
+                        &state.config,
+                        was_locked,
+                    );
+                    remove_tray_icon(hwnd, &mut state.tray_icon_added);
                     state.app_state = AppStateKind::LoggedOut;
                     let clear_args = extract_clear_main_args(handles, state);
                     state.clear_session_fields();
                     unsafe {
+                        let empty = to_wide("");
+                        SetWindowTextW(handles.lock_pass_edit, empty.as_ptr());
+                        SetWindowTextW(handles.lock_status, empty.as_ptr());
                         SetMenu(hwnd, null_mut());
                         windows_sys::Win32::UI::WindowsAndMessaging::DrawMenuBar(hwnd);
                     }
-                    sync_menu_enabled_state(handles.hmenu_main, false);
+                    sync_menu_enabled_state(handles.hmenu_main, AppStateKind::LoggedOut);
+                    show_lock_controls(handles, false);
                     show_main_controls(handles, false);
                     show_login_controls(handles, true);
                     set_authenticating_ui(handles, false);
@@ -1190,14 +1780,18 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                 }
             }
             AppEvent::ShutdownReady => {
-                let clear_args = with_ui_and_state_mut(|handles, state| {
+                let exit_info = with_ui_and_state_mut(|handles, state| {
+                    let was_locked = state.app_state == AppStateKind::Locked;
+                    let cfg = state.config.clone();
+                    remove_tray_icon(hwnd, &mut state.tray_icon_added);
                     state.app_state = AppStateKind::Exiting;
                     let args = extract_clear_main_args(handles, state);
                     state.clear_session_fields();
-                    args
+                    (args, cfg, was_locked)
                 });
-                if let Some(args) = clear_args {
+                if let Some((args, cfg, was_locked)) = exit_info {
                     apply_clear_main_controls(args);
+                    play_logout_on_exit_sync(&cfg, was_locked);
                 }
                 unsafe {
                     DestroyWindow(hwnd);
