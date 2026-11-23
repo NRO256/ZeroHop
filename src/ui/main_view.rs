@@ -43,23 +43,27 @@ use super::a11y::{
     focus_control, focus_listview_item, get_selected_listview_index, safe_disable_window,
     set_cue_banner,
 };
-use super::dialogs::{DetailDialogAction, DetailDialogInput, show_message_detail_dialog};
+use super::dialogs::{
+    DetailDialogAction, DetailDialogInput, confirm_file_offer_dialog, pick_open_file_dialog,
+    pick_save_file_dialog, show_message_detail_dialog,
+};
 use super::login_view::{
     reset_login_form, set_authenticating_ui, set_login_status_message, show_login_controls,
 };
 use super::menu_bar::{sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check};
 use super::sound::{SoundEvent, play_logout_on_exit_sync, play_sound_if_allowed};
 use super::state_helpers::{
-    UiHandles, UiState, with_state, with_state_mut, with_ui, with_ui_and_state_mut,
+    ActiveUiTransfer, PendingUiFileOffer, UiHandles, UiState, with_state, with_state_mut, with_ui,
+    with_ui_and_state_mut,
 };
 use super::theme::{apply_listview_explorer_theme, scale_dpi};
 use super::{
     IDC_LOCK_GUIDE, IDC_LOCK_LOGOUT_BTN, IDC_LOCK_PASS_EDIT, IDC_LOCK_PASS_LABEL, IDC_LOCK_STATUS,
     IDC_LOCK_TITLE, IDC_LOCK_UNLOCK_BTN, IDC_MAIN_BYTE_GUIDE, IDC_MAIN_CHAT_LIST,
-    IDC_MAIN_INPUT_EDIT, IDC_MAIN_NOTICE, IDC_MAIN_PEER_LABEL, IDC_MAIN_PEER_LIST,
-    IDC_MAIN_SEND_BTN, IDC_MAIN_STATUSBAR, IDC_MAIN_THREAD_HEADER, WM_APP_OPEN_DETAIL,
-    WM_APP_TRAY_CALLBACK, format_bytes_human, format_remaining_bytes_label, format_unix_datetime,
-    format_unix_time_hms, is_message_retryable, normalized_utf8_byte_len,
+    IDC_MAIN_FILE_BTN, IDC_MAIN_INPUT_EDIT, IDC_MAIN_NOTICE, IDC_MAIN_PEER_LABEL,
+    IDC_MAIN_PEER_LIST, IDC_MAIN_SEND_BTN, IDC_MAIN_STATUSBAR, IDC_MAIN_THREAD_HEADER,
+    WM_APP_OPEN_DETAIL, WM_APP_TRAY_CALLBACK, format_bytes_human, format_remaining_bytes_label,
+    format_unix_datetime, format_unix_time_hms, is_message_retryable, normalized_utf8_byte_len,
     read_window_text_zeroizing, resolve_migrated_thread, summarize_message_body, to_wide,
     write_utf16_buf,
 };
@@ -91,6 +95,7 @@ pub(crate) struct MainControlHandles {
     pub byte_guide: HWND,
     pub input_edit: HWND,
     pub send_btn: HWND,
+    pub file_btn: HWND,
     pub statusbar: HWND,
 }
 
@@ -419,6 +424,16 @@ pub(crate) fn create_main_controls(
         IDC_MAIN_SEND_BTN,
         ui_font,
     );
+    let file_btn = make_ctrl(
+        hwnd_parent,
+        hinst,
+        button_w.as_ptr(),
+        "ファイル(&F)...",
+        0,
+        WS_CHILD | WS_TABSTOP | (BS_PUSHBUTTON as u32),
+        IDC_MAIN_FILE_BTN,
+        ui_font,
+    );
     let statusbar = make_ctrl(
         hwnd_parent,
         hinst,
@@ -439,6 +454,7 @@ pub(crate) fn create_main_controls(
         byte_guide,
         input_edit,
         send_btn,
+        file_btn,
         statusbar,
     }
 }
@@ -524,13 +540,24 @@ pub(crate) fn layout_main_controls(handles: &UiHandles, client_w: i32, client_h:
         y += guide_h + s(4);
 
         let edit_w = (right_w - btn_w - s(8)).max(s(120));
+        let send_h = s(44);
+        let gap_h = s(4);
+        let file_h = (input_h - send_h - gap_h).max(s(24));
         MoveWindow(handles.main_input_edit, right_x, y, edit_w, input_h, 1);
         MoveWindow(
             handles.main_send_btn,
             right_x + edit_w + s(8),
             y,
             btn_w,
-            input_h,
+            send_h,
+            1,
+        );
+        MoveWindow(
+            handles.main_file_btn,
+            right_x + edit_w + s(8),
+            y + send_h + gap_h,
+            btn_w,
+            file_h,
             1,
         );
 
@@ -1078,11 +1105,14 @@ pub(crate) fn handle_peer_list_selchange() {
             state.active_thread = next_thread;
             state.last_lv_count = 0;
             refresh_peer_list(handles, state);
+            sync_file_transfer_button(handles, state);
             Some(prepare_virtual_listview_sync(handles, state, true))
         } else if cleared {
             refresh_peer_list(handles, state);
+            sync_file_transfer_button(handles, state);
             None
         } else {
+            sync_file_transfer_button(handles, state);
             None
         }
     })
@@ -1404,6 +1434,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
                     show_main_controls(handles, true);
                     refresh_peer_list(handles, state);
+                    sync_file_transfer_button(handles, state);
                     let lv = prepare_virtual_listview_sync(handles, state, true);
                     update_input_byte_guide(handles);
                     set_notice_text(handles, state, "");
@@ -1447,6 +1478,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         return None;
                     }
                     let thread_changed = refresh_peer_list(handles, state);
+                    sync_file_transfer_button(handles, state);
                     if thread_changed {
                         state.last_lv_count = 0;
                         Some(prepare_virtual_listview_sync(handles, state, true))
@@ -1736,6 +1768,88 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     );
                 });
             }
+            AppEvent::FileOfferReceived {
+                transfer_id,
+                peer_id: _,
+                peer_name,
+                filename,
+                file_size,
+                sha256_hex,
+            } => {
+                let should_process = with_state_mut(|state| {
+                    if state.app_state != AppStateKind::LoggedIn {
+                        return false;
+                    }
+                    state.pending_file_offers.push_back(PendingUiFileOffer {
+                        transfer_id,
+                        peer_name,
+                        filename,
+                        file_size,
+                        sha256_hex,
+                    });
+                    !state.modal_open
+                })
+                .unwrap_or(false);
+                if should_process {
+                    process_pending_file_offers(hwnd);
+                }
+            }
+            AppEvent::FileTransferProgress {
+                transfer_id,
+                peer_id: _,
+                filename,
+                is_sending,
+                transferred_bytes,
+                total_bytes,
+            } => {
+                with_ui_and_state_mut(|handles, state| {
+                    if state.app_state != AppStateKind::LoggedIn {
+                        return;
+                    }
+                    state.active_transfer = Some(ActiveUiTransfer { transfer_id });
+                    let pct = transferred_bytes
+                        .saturating_mul(100)
+                        .checked_div(total_bytes)
+                        .unwrap_or(0)
+                        .min(100);
+                    let verb = if is_sending { "送信中" } else { "受信中" };
+                    let cur_h = format_bytes_human(transferred_bytes as usize);
+                    let tot_h = format_bytes_human(total_bytes as usize);
+                    set_notice_text(
+                        handles,
+                        state,
+                        &format!("[{verb}] {filename}: {pct}% ({cur_h} / {tot_h})"),
+                    );
+                    sync_file_transfer_button(handles, state);
+                });
+            }
+            AppEvent::FileTransferFinished {
+                transfer_id,
+                peer_id: _,
+                filename,
+                is_sending: _,
+                ok,
+                message,
+            } => {
+                with_ui_and_state_mut(|handles, state| {
+                    if state
+                        .active_transfer
+                        .as_ref()
+                        .is_some_and(|t| t.transfer_id == transfer_id)
+                    {
+                        state.active_transfer = None;
+                    }
+                    if state.app_state == AppStateKind::LoggedIn {
+                        let prefix = if ok { "完了" } else { "中断" };
+                        set_notice_text(
+                            handles,
+                            state,
+                            &format!("[ファイル{prefix}] {filename}: {message}"),
+                        );
+                        sync_file_transfer_button(handles, state);
+                    }
+                });
+            }
             AppEvent::ErrorNotice(msg) => {
                 with_ui_and_state_mut(|handles, state| {
                     if state.app_state == AppStateKind::LoggedIn {
@@ -1798,5 +1912,162 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                 }
             }
         }
+    }
+}
+
+pub(crate) fn sync_file_transfer_button(handles: &UiHandles, state: &UiState) {
+    if handles.main_file_btn.is_null() {
+        return;
+    }
+    let (label, enabled) = if state.active_transfer.is_some() {
+        ("転送中止(&F)", state.app_state == AppStateKind::LoggedIn)
+    } else {
+        let can_send = state.app_state == AppStateKind::LoggedIn
+            && match &state.active_thread {
+                ThreadKey::Peer(pid) => {
+                    state.peers.iter().any(|p| &p.peer_id == pid && p.is_online)
+                }
+                ThreadKey::Broadcast => false,
+            };
+        ("ファイル(&F)...", can_send)
+    };
+    let w_label = to_wide(label);
+    unsafe {
+        SetWindowTextW(handles.main_file_btn, w_label.as_ptr());
+        EnableWindow(handles.main_file_btn, i32::from(enabled));
+    }
+}
+
+pub(crate) fn handle_file_button_clicked(hwnd: HWND) {
+    let is_transferring = with_state(|s| s.active_transfer.is_some()).unwrap_or(false);
+    if is_transferring {
+        cancel_active_file_transfer();
+    } else {
+        start_send_file_flow(hwnd);
+    }
+}
+
+pub(crate) fn start_send_file_flow(hwnd: HWND) {
+    let target_peer = with_ui_and_state_mut(|handles, state| {
+        if state.app_state != AppStateKind::LoggedIn || state.modal_open {
+            return None;
+        }
+        if state.active_transfer.is_some() {
+            set_notice_text(
+                handles,
+                state,
+                "現在別のファイル転送が進行中です。完了または中止後に実行してください。",
+            );
+            return None;
+        }
+        match &state.active_thread {
+            ThreadKey::Peer(pid) => {
+                let online = state.peers.iter().any(|p| &p.peer_id == pid && p.is_online);
+                if online {
+                    state.modal_open = true;
+                    Some(pid.clone())
+                } else {
+                    set_notice_text(
+                        handles,
+                        state,
+                        "選択中の相手がオフラインのためファイル送信できません。",
+                    );
+                    None
+                }
+            }
+            ThreadKey::Broadcast => {
+                set_notice_text(
+                    handles,
+                    state,
+                    "全体チャットではファイル送信できません。左の一覧から送信先の相手を選択してください。",
+                );
+                None
+            }
+        }
+    })
+    .flatten();
+
+    let Some(peer_id) = target_peer else {
+        return;
+    };
+
+    let selected = pick_open_file_dialog(hwnd);
+    with_ui_and_state_mut(|handles, state| {
+        state.modal_open = false;
+        if let Some(path) = selected {
+            let _ = state.cmd_tx.try_send(UiCommand::SendFile {
+                peer_id,
+                file_path: path,
+            });
+            set_notice_text(handles, state, "ファイル送信要求を送信しています...");
+        }
+    });
+    process_pending_file_offers(hwnd);
+}
+
+pub(crate) fn cancel_active_file_transfer() {
+    with_ui_and_state_mut(|handles, state| {
+        if state.app_state != AppStateKind::LoggedIn {
+            return;
+        }
+        if let Some(tr) = &state.active_transfer {
+            let tid = tr.transfer_id.clone();
+            let _ = state
+                .cmd_tx
+                .try_send(UiCommand::CancelFileTransfer { transfer_id: tid });
+            set_notice_text(handles, state, "ファイル転送の中止を要求しました。");
+        } else {
+            set_notice_text(handles, state, "現在進行中のファイル転送はありません。");
+        }
+    });
+}
+
+pub(crate) fn process_pending_file_offers(hwnd: HWND) {
+    loop {
+        let next_offer = with_state_mut(|state| {
+            if state.app_state != AppStateKind::LoggedIn || state.modal_open {
+                return None;
+            }
+            let offer = state.pending_file_offers.pop_front()?;
+            state.modal_open = true;
+            Some(offer)
+        })
+        .flatten();
+
+        let Some(offer) = next_offer else {
+            break;
+        };
+
+        let accepted = confirm_file_offer_dialog(
+            hwnd,
+            &offer.peer_name,
+            &offer.filename,
+            offer.file_size,
+            &offer.sha256_hex,
+        );
+        let save_path = if accepted {
+            pick_save_file_dialog(hwnd, &offer.filename)
+        } else {
+            None
+        };
+
+        with_ui_and_state_mut(|handles, state| {
+            state.modal_open = false;
+            if state.app_state == AppStateKind::LoggedIn {
+                let accept_final = save_path.is_some();
+                let _ = state.cmd_tx.try_send(UiCommand::RespondFileOffer {
+                    transfer_id: offer.transfer_id,
+                    accept: accept_final,
+                    save_path,
+                });
+                if accept_final {
+                    set_notice_text(
+                        handles,
+                        state,
+                        &format!("ファイル受信を開始します: {}", offer.filename),
+                    );
+                }
+            }
+        });
     }
 }

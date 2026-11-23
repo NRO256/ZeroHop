@@ -1,7 +1,7 @@
 //! スレッドローカル状態管理・6ヘルパー集約パターン・WndProc パニック境界保護。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -50,6 +50,7 @@ pub(crate) struct UiHandles {
     pub main_byte_guide: HWND,
     pub main_input_edit: HWND,
     pub main_send_btn: HWND,
+    pub main_file_btn: HWND,
     pub main_statusbar: HWND,
 
     // ロック画面コントロール群 (Phase 2)
@@ -80,7 +81,7 @@ impl UiHandles {
         ]
     }
 
-    pub fn main_controls(&self) -> [HWND; 9] {
+    pub fn main_controls(&self) -> [HWND; 10] {
         [
             self.main_peer_label,
             self.main_peer_list,
@@ -90,6 +91,7 @@ impl UiHandles {
             self.main_byte_guide,
             self.main_input_edit,
             self.main_send_btn,
+            self.main_file_btn,
             self.main_statusbar,
         ]
     }
@@ -106,7 +108,7 @@ impl UiHandles {
         ]
     }
 
-    pub fn all_ui_font_controls(&self) -> [HWND; 25] {
+    pub fn all_ui_font_controls(&self) -> [HWND; 26] {
         [
             self.login_subtitle,
             self.login_name_label,
@@ -126,6 +128,7 @@ impl UiHandles {
             self.main_byte_guide,
             self.main_input_edit,
             self.main_send_btn,
+            self.main_file_btn,
             self.main_statusbar,
             self.lock_guide,
             self.lock_pass_label,
@@ -135,6 +138,20 @@ impl UiHandles {
             self.lock_status,
         ]
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveUiTransfer {
+    pub transfer_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingUiFileOffer {
+    pub transfer_id: String,
+    pub peer_name: String,
+    pub filename: String,
+    pub file_size: u64,
+    pub sha256_hex: String,
 }
 
 pub(crate) struct UiState {
@@ -168,6 +185,8 @@ pub(crate) struct UiState {
     pub last_search_query: Zeroizing<String>,
     pub auto_away_triggered: bool,
     pub tray_icon_added: bool,
+    pub active_transfer: Option<ActiveUiTransfer>,
+    pub pending_file_offers: VecDeque<PendingUiFileOffer>,
 }
 
 impl UiState {
@@ -196,6 +215,8 @@ impl UiState {
         }
         self.last_search_query.zeroize();
         self.auto_away_triggered = false;
+        self.active_transfer = None;
+        self.pending_file_offers.clear();
     }
 }
 

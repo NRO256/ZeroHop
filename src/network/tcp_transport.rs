@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::io::{BufReader, Read};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,12 +14,13 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::domain::protocol::{
-    FrameKind, ProtocolError, TCP_PREAMBLE_LEN, TcpPayload, decode_tcp_control_body,
-    encode_tcp_control_frame, validate_tcp_frame_preamble,
+    FileChunkHeader, FrameKind, MAX_FILE_CHUNK_RAW_BYTES, ProtocolError, TCP_PREAMBLE_LEN,
+    TcpPayload, decode_tcp_control_body, decode_tcp_file_chunk_body, encode_tcp_control_frame,
+    encode_tcp_file_chunk_frame, validate_tcp_frame_preamble,
 };
 use crate::network::rate_limit::AnomalyRateLimiter;
 use crate::network::udp_discovery::normalize_ip;
-use crate::network::{AnomalyEvent, NetworkError};
+use crate::network::{AnomalyEvent, NetworkError, current_unix_timestamp};
 
 pub const TCP_FALLBACK_PORT_START: u16 = 45101;
 pub const TCP_FALLBACK_PORT_END: u16 = 45120;
@@ -48,8 +51,20 @@ pub struct InboundTcpMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundTcpFileChunk {
+    pub peer_ip: IpAddr,
+    pub header: FileChunkHeader,
+    pub data: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundTcpEvent {
     Payload(InboundTcpMessage),
+    FileChunk(InboundTcpFileChunk),
+    FileStreamClosed {
+        peer_ip: IpAddr,
+        transfer_id: String,
+    },
     Anomaly(AnomalyEvent),
 }
 
@@ -172,23 +187,86 @@ pub async fn read_tcp_control_frame(
     decode_tcp_control_body(msg_key, &header, &remaining).map_err(TcpReadError::Protocol)
 }
 
-async fn handle_incoming_connection(
-    mut stream: TcpStream,
-    peer_ip: IpAddr,
+#[allow(clippy::too_many_arguments)]
+pub async fn send_file_chunks_stream(
+    target: SocketAddr,
     msg_key: Zeroizing<[u8; 32]>,
-    tx: mpsc::Sender<InboundTcpEvent>,
-    anomaly_limiter: Arc<Mutex<AnomalyRateLimiter>>,
-) {
-    match read_tcp_control_frame(&mut stream, &msg_key).await {
-        Ok(payload) => {
-            let _ = tx
-                .send(InboundTcpEvent::Payload(InboundTcpMessage {
-                    peer_ip,
-                    payload,
-                }))
-                .await;
+    transfer_id: String,
+    sender_id: String,
+    file_path: PathBuf,
+    expected_size: u64,
+    cancel: CancellationToken,
+    progress_tx: mpsc::Sender<u64>,
+) -> Result<(), NetworkError> {
+    let file = std::fs::File::open(&file_path)?;
+    let mut reader = BufReader::with_capacity(MAX_FILE_CHUNK_RAW_BYTES, file);
+
+    let mut stream = tokio::select! {
+        _ = cancel.cancelled() => return Err(NetworkError::Cancelled),
+        res = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(target)) => {
+            res.map_err(|_| NetworkError::Timeout)??
         }
-        Err(TcpReadError::Protocol(ProtocolError::VersionMismatch { received_version })) => {
+    };
+    let _ = stream.set_nodelay(true);
+
+    let mut buf = Zeroizing::new(vec![0u8; MAX_FILE_CHUNK_RAW_BYTES]);
+    let mut chunk_index: u64 = 0;
+    let mut total_sent: u64 = 0;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(NetworkError::Cancelled);
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total_sent = total_sent.saturating_add(n as u64);
+        let header = FileChunkHeader {
+            transfer_id: transfer_id.clone(),
+            sender_id: sender_id.clone(),
+            chunk_index,
+            timestamp: current_unix_timestamp(),
+        };
+        let frame = encode_tcp_file_chunk_frame(&msg_key, &header, &buf[..n])?;
+
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(NetworkError::Cancelled),
+            res = tokio::time::timeout(TCP_WRITE_TIMEOUT, stream.write_all(&frame)) => {
+                res.map_err(|_| NetworkError::Timeout)??;
+            }
+        }
+
+        chunk_index += 1;
+        let _ = progress_tx.try_send(total_sent);
+        tokio::task::yield_now().await;
+    }
+
+    if total_sent != expected_size {
+        return Err(NetworkError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "送信中にファイルサイズが変化しました",
+        )));
+    }
+
+    tokio::time::timeout(TCP_WRITE_TIMEOUT, async {
+        stream.flush().await?;
+        stream.shutdown().await
+    })
+    .await
+    .map_err(|_| NetworkError::Timeout)??;
+
+    Ok(())
+}
+
+async fn report_tcp_read_anomaly(
+    err: &TcpReadError,
+    peer_ip: IpAddr,
+    tx: &mpsc::Sender<InboundTcpEvent>,
+    anomaly_limiter: &Arc<Mutex<AnomalyRateLimiter>>,
+) {
+    match err {
+        TcpReadError::Protocol(ProtocolError::VersionMismatch { received_version }) => {
             let allowed = {
                 let mut guard = anomaly_limiter.lock().await;
                 guard.allow_at(peer_ip, Instant::now())
@@ -198,13 +276,13 @@ async fn handle_incoming_connection(
                     .send(InboundTcpEvent::Anomaly(
                         AnomalyEvent::ProtocolVersionMismatch {
                             peer_ip,
-                            received_version,
+                            received_version: *received_version,
                         },
                     ))
                     .await;
             }
         }
-        Err(TcpReadError::Protocol(ProtocolError::DecryptionFailed)) => {
+        TcpReadError::Protocol(ProtocolError::DecryptionFailed) => {
             let allowed = {
                 let mut guard = anomaly_limiter.lock().await;
                 guard.allow_at(peer_ip, Instant::now())
@@ -217,7 +295,181 @@ async fn handle_incoming_connection(
                     .await;
             }
         }
-        Err(_) => {}
+        _ => {}
+    }
+}
+
+async fn read_preamble_or_eof(
+    stream: &mut TcpStream,
+) -> Result<Option<[u8; TCP_PREAMBLE_LEN]>, TcpReadError> {
+    let mut preamble = [0u8; TCP_PREAMBLE_LEN];
+    let mut filled = 0;
+    while filled < TCP_PREAMBLE_LEN {
+        let n = tokio::time::timeout(
+            TCP_PREAMBLE_READ_TIMEOUT,
+            stream.read(&mut preamble[filled..]),
+        )
+        .await
+        .map_err(|_| TcpReadError::Timeout)??;
+        if n == 0 {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(TcpReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "プリアンブル途中で切断されました",
+            )));
+        }
+        filled += n;
+    }
+    Ok(Some(preamble))
+}
+
+async fn handle_incoming_connection(
+    mut stream: TcpStream,
+    peer_ip: IpAddr,
+    msg_key: Zeroizing<[u8; 32]>,
+    tx: mpsc::Sender<InboundTcpEvent>,
+    anomaly_limiter: Arc<Mutex<AnomalyRateLimiter>>,
+) {
+    let mut preamble = [0u8; TCP_PREAMBLE_LEN];
+    if let Err(err) =
+        tokio::time::timeout(TCP_PREAMBLE_READ_TIMEOUT, stream.read_exact(&mut preamble))
+            .await
+            .map_err(|_| TcpReadError::Timeout)
+            .and_then(|r| r.map_err(TcpReadError::Io))
+    {
+        report_tcp_read_anomaly(&err, peer_ip, &tx, &anomaly_limiter).await;
+        return;
+    }
+
+    let header = match validate_tcp_frame_preamble(&preamble) {
+        Ok(h) => h,
+        Err(err) => {
+            report_tcp_read_anomaly(&TcpReadError::Protocol(err), peer_ip, &tx, &anomaly_limiter)
+                .await;
+            return;
+        }
+    };
+
+    match header.frame_kind {
+        FrameKind::ControlJson => {
+            let mut remaining = vec![0u8; header.remaining_len];
+            if let Err(err) =
+                tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut remaining))
+                    .await
+                    .map_err(|_| TcpReadError::Timeout)
+                    .and_then(|r| r.map_err(TcpReadError::Io))
+            {
+                report_tcp_read_anomaly(&err, peer_ip, &tx, &anomaly_limiter).await;
+                return;
+            }
+            match decode_tcp_control_body(&msg_key, &header, &remaining) {
+                Ok(payload) => {
+                    let _ = tx
+                        .send(InboundTcpEvent::Payload(InboundTcpMessage {
+                            peer_ip,
+                            payload,
+                        }))
+                        .await;
+                }
+                Err(err) => {
+                    report_tcp_read_anomaly(
+                        &TcpReadError::Protocol(err),
+                        peer_ip,
+                        &tx,
+                        &anomaly_limiter,
+                    )
+                    .await;
+                }
+            }
+        }
+        FrameKind::FileChunk => {
+            let mut current_header = header;
+            let mut first_transfer_id: Option<String> = None;
+            loop {
+                let mut remaining = vec![0u8; current_header.remaining_len];
+                if let Err(err) =
+                    tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut remaining))
+                        .await
+                        .map_err(|_| TcpReadError::Timeout)
+                        .and_then(|r| r.map_err(TcpReadError::Io))
+                {
+                    report_tcp_read_anomaly(&err, peer_ip, &tx, &anomaly_limiter).await;
+                    break;
+                }
+
+                match decode_tcp_file_chunk_body(&msg_key, &current_header, &remaining) {
+                    Ok((chunk_header, data)) => {
+                        if first_transfer_id.is_none() {
+                            first_transfer_id = Some(chunk_header.transfer_id.clone());
+                        }
+                        if tx
+                            .send(InboundTcpEvent::FileChunk(InboundTcpFileChunk {
+                                peer_ip,
+                                header: chunk_header,
+                                data,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        report_tcp_read_anomaly(
+                            &TcpReadError::Protocol(err),
+                            peer_ip,
+                            &tx,
+                            &anomaly_limiter,
+                        )
+                        .await;
+                        break;
+                    }
+                }
+
+                match read_preamble_or_eof(&mut stream).await {
+                    Ok(Some(next_preamble)) => match validate_tcp_frame_preamble(&next_preamble) {
+                        Ok(next_hdr) if next_hdr.frame_kind == FrameKind::FileChunk => {
+                            current_header = next_hdr;
+                        }
+                        Ok(next_hdr) => {
+                            report_tcp_read_anomaly(
+                                &TcpReadError::UnsupportedKind(next_hdr.frame_kind as u8),
+                                peer_ip,
+                                &tx,
+                                &anomaly_limiter,
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(err) => {
+                            report_tcp_read_anomaly(
+                                &TcpReadError::Protocol(err),
+                                peer_ip,
+                                &tx,
+                                &anomaly_limiter,
+                            )
+                            .await;
+                            break;
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(err) => {
+                        report_tcp_read_anomaly(&err, peer_ip, &tx, &anomaly_limiter).await;
+                        break;
+                    }
+                }
+            }
+            if let Some(transfer_id) = first_transfer_id {
+                let _ = tx
+                    .send(InboundTcpEvent::FileStreamClosed {
+                        peer_ip,
+                        transfer_id,
+                    })
+                    .await;
+            }
+        }
     }
 }
 

@@ -25,6 +25,8 @@ pub enum NetworkError {
     NoAvailablePort,
     #[error("無効な通信先アドレスです: {0}")]
     InvalidEndpoint(String),
+    #[error("通信がキャンセルされました")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

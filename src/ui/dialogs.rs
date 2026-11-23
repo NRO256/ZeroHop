@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::mem::{size_of, zeroed};
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -13,6 +14,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
+    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -20,13 +25,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CS_HREDRAW, CS_VREDRAW,
     CreateWindowExW, DC_HASDEFID, DM_GETDEFID, DefWindowProcW, DestroyWindow, DispatchMessageW,
     ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER, ES_READONLY, GWLP_USERDATA,
-    GetMessageW, GetWindowLongPtrW, IDC_ARROW, IDCANCEL, IDOK, IsDialogMessageW, LB_ADDSTRING,
-    LB_GETCURSEL, LB_RESETCONTENT, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LoadCursorW,
-    MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassExW, SW_SHOW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TranslateMessage, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WNDCLASSEXW,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
-    WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetMessageW, GetWindowLongPtrW, IDC_ARROW, IDCANCEL, IDOK, IDYES, IsDialogMessageW,
+    LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    LoadCursorW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW,
+    PostQuitMessage, RegisterClassExW, SW_SHOW, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -42,8 +48,8 @@ use lan_messenger::storage::paths::AppPaths;
 use super::a11y::set_cue_banner;
 use super::theme::{ThemeResources, apply_window_dwm_attributes, center_rect_on_parent, scale_dpi};
 use super::{
-    APP_NAME, APP_VERSION, format_unix_datetime, normalize_crlf, read_window_text,
-    read_window_text_zeroizing, to_wide,
+    APP_NAME, APP_VERSION, format_bytes_human, format_unix_datetime, normalize_crlf,
+    read_window_text, read_window_text_zeroizing, to_wide,
 };
 
 const MODAL_CLASS_NAME: &str = "LanMessengerModalDialogClass";
@@ -1782,4 +1788,96 @@ pub(crate) fn show_about_dialog(parent: HWND, dpi: u32) {
         420,
         dpi,
     );
+}
+
+pub(crate) fn pick_open_file_dialog(owner: HWND) -> Option<PathBuf> {
+    let mut file_buf = vec![0u16; 4096];
+    let filter: Vec<u16> = "すべてのファイル (*.*)\0*.*\0\0".encode_utf16().collect();
+    let title = to_wide("送信するファイルを選択 (最大 50 MiB)");
+
+    let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
+    ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if ok == 0 {
+        return None;
+    }
+    let nul_pos = file_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(file_buf.len());
+    let path_str = String::from_utf16_lossy(&file_buf[..nul_pos]);
+    if path_str.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path_str))
+    }
+}
+
+pub(crate) fn pick_save_file_dialog(owner: HWND, default_filename: &str) -> Option<PathBuf> {
+    let mut file_buf = vec![0u16; 4096];
+    let default_units: Vec<u16> = default_filename.encode_utf16().take(255).collect();
+    file_buf[..default_units.len()].copy_from_slice(&default_units);
+
+    let filter: Vec<u16> = "すべてのファイル (*.*)\0*.*\0\0".encode_utf16().collect();
+    let title = to_wide("受信ファイルの保存先を指定");
+
+    let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
+    ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+    if ok == 0 {
+        return None;
+    }
+    let nul_pos = file_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(file_buf.len());
+    let path_str = String::from_utf16_lossy(&file_buf[..nul_pos]);
+    if path_str.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path_str))
+    }
+}
+
+pub(crate) fn confirm_file_offer_dialog(
+    owner: HWND,
+    peer_name: &str,
+    filename: &str,
+    file_size: u64,
+    sha256_hex: &str,
+) -> bool {
+    let size_human = format_bytes_human(file_size as usize);
+    let sha_short: String = sha256_hex.chars().take(16).collect();
+    let msg = format!(
+        "{peer_name} からファイル送信の要求があります。\n\n\
+         ファイル名: {filename}\n\
+         サイズ: {size_human} ({file_size} バイト)\n\
+         SHA-256先頭: {sha_short}...\n\n\
+         保存先を指定して受信しますか？"
+    );
+    let w_msg = to_wide(&msg);
+    let w_title = to_wide("ファイル受信の確認 - LanMessenger");
+    let ret = unsafe {
+        MessageBoxW(
+            owner,
+            w_msg.as_ptr(),
+            w_title.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    };
+    ret == IDYES
 }

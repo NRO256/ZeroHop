@@ -1,6 +1,7 @@
 pub mod cache_wipe;
 pub mod config;
 pub mod paths;
+pub mod transfer_store;
 
 use thiserror::Error;
 

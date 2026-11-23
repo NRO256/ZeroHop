@@ -9,7 +9,7 @@ pub mod sound;
 pub mod state_helpers;
 pub mod theme;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
@@ -63,12 +63,14 @@ use login_view::{
     update_password_guide,
 };
 use main_view::{
-    apply_clear_main_controls, clear_unread_for_thread, create_lock_controls, create_main_controls,
-    drain_app_events, extract_clear_main_args, handle_lv_getdispinfo, handle_peer_list_selchange,
+    apply_clear_main_controls, cancel_active_file_transfer, clear_unread_for_thread,
+    create_lock_controls, create_main_controls, drain_app_events, extract_clear_main_args,
+    handle_file_button_clicked, handle_lv_getdispinfo, handle_peer_list_selchange,
     jump_to_search_hit, layout_lock_controls, layout_main_controls, open_selected_message_detail,
     refresh_peer_list, remove_main_subclasses, remove_tray_icon, retry_selected_message,
     send_current_input, set_input_send_on_enter, set_notice_text, show_lock_controls,
-    show_main_controls, submit_unlock, update_input_byte_guide, update_status_bar,
+    show_main_controls, start_send_file_flow, submit_unlock, update_input_byte_guide,
+    update_status_bar,
 };
 use menu_bar::{
     create_main_menu_bar, sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check,
@@ -112,6 +114,8 @@ pub(crate) const IDM_LOCK_SCREEN: usize = 1016;
 pub(crate) const IDM_SEARCH: usize = 1017;
 pub(crate) const IDM_TOGGLE_SOUND: usize = 1018;
 pub(crate) const IDM_TOGGLE_SEND_ON_ENTER: usize = 1019;
+pub(crate) const IDM_SEND_FILE: usize = 1020;
+pub(crate) const IDM_CANCEL_FILE_TRANSFER: usize = 1021;
 
 // ログイン画面コントロール ID
 pub(crate) const IDC_LOGIN_TITLE: usize = 2001;
@@ -137,6 +141,7 @@ pub(crate) const IDC_MAIN_BYTE_GUIDE: usize = 3006;
 pub(crate) const IDC_MAIN_INPUT_EDIT: usize = 3007;
 pub(crate) const IDC_MAIN_SEND_BTN: usize = 3008;
 pub(crate) const IDC_MAIN_STATUSBAR: usize = 3009;
+pub(crate) const IDC_MAIN_FILE_BTN: usize = 3010;
 
 // ロック画面コントロール ID (Phase 2)
 pub(crate) const IDC_LOCK_TITLE: usize = 4001;
@@ -834,6 +839,7 @@ unsafe extern "system" fn main_wnd_proc(
                     main_byte_guide: main_ctrls.byte_guide,
                     main_input_edit: main_ctrls.input_edit,
                     main_send_btn: main_ctrls.send_btn,
+                    main_file_btn: main_ctrls.file_btn,
                     main_statusbar: main_ctrls.statusbar,
                     lock_title: lock_ctrls.title,
                     lock_guide: lock_ctrls.guide,
@@ -874,6 +880,8 @@ unsafe extern "system" fn main_wnd_proc(
                     last_search_query: Zeroizing::new(String::new()),
                     auto_away_triggered: false,
                     tray_icon_added: false,
+                    active_transfer: None,
+                    pending_file_offers: VecDeque::new(),
                 };
                 if let Ok(mut slot) = init_box.join_slot.lock() {
                     *slot = Some(app_handle.join_handle);
@@ -1074,6 +1082,10 @@ unsafe extern "system" fn main_wnd_proc(
                         send_current_input();
                         return 0;
                     }
+                    IDC_MAIN_FILE_BTN if code == BN_CLICKED => {
+                        handle_file_button_clicked(hwnd);
+                        return 0;
+                    }
                     IDC_LOCK_UNLOCK_BTN if code == BN_CLICKED => {
                         submit_unlock();
                         return 0;
@@ -1181,6 +1193,14 @@ unsafe extern "system" fn main_wnd_proc(
                                 );
                             }
                         });
+                        return 0;
+                    }
+                    IDM_SEND_FILE => {
+                        start_send_file_flow(hwnd);
+                        return 0;
+                    }
+                    IDM_CANCEL_FILE_TRANSFER => {
+                        cancel_active_file_transfer();
                         return 0;
                     }
                     IDM_ADD_MANUAL_PEER => {
@@ -1362,6 +1382,10 @@ fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
     }
     if ctrl && !shift && msg.wParam == b'F' as usize {
         unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEARCH, 0) };
+        return true;
+    }
+    if ctrl && shift && msg.wParam == b'F' as usize {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEND_FILE, 0) };
         return true;
     }
 

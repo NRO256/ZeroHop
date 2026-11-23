@@ -40,6 +40,8 @@ pub enum ValidationError {
     InvalidFilename,
     #[error("ファイルサイズは1バイト以上50 MiB以下である必要があります")]
     InvalidFileSize,
+    #[error("SHA-256チェックサムの形式が不正です")]
+    InvalidSha256,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +260,13 @@ pub fn validate_file_size(size: u64) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidFileSize);
     }
     Ok(())
+}
+
+pub fn validate_sha256_hex(raw: &str) -> Result<String, ValidationError> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ValidationError::InvalidSha256);
+    }
+    Ok(raw.to_ascii_lowercase())
 }
 
 #[cfg(test)]

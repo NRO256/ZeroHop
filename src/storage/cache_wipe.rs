@@ -16,7 +16,7 @@ pub struct CacheWipeReport {
 }
 
 #[allow(clippy::permissions_set_readonly_false)]
-fn clear_readonly_if_needed(path: &Path, is_dir: bool) {
+pub(crate) fn clear_readonly_if_needed(path: &Path, is_dir: bool) {
     if is_dir {
         return;
     }
@@ -29,7 +29,7 @@ fn clear_readonly_if_needed(path: &Path, is_dir: bool) {
     }
 }
 
-fn overwrite_zero_best_effort(path: &Path, file_len: u64) {
+pub(crate) fn overwrite_zero_best_effort(path: &Path, file_len: u64) {
     if file_len == 0 || file_len > MAX_ZERO_WIPE_BYTES {
         return;
     }

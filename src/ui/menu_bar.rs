@@ -10,10 +10,10 @@ use lan_messenger::domain::model::UserStatus;
 use lan_messenger::storage::config::LocalConfig;
 
 use super::{
-    IDM_ABOUT, IDM_ADD_MANUAL_PEER, IDM_CLEAR_ALL, IDM_CLEAR_CURRENT, IDM_CONN_INFO, IDM_EXIT,
-    IDM_LOCK_SCREEN, IDM_LOGOUT, IDM_OPTIONS, IDM_REFRESH_NETWORK, IDM_RETRY_SELECTED, IDM_SEARCH,
-    IDM_SHORTCUTS, IDM_SHOW_DETAIL, IDM_STATUS_AWAY, IDM_STATUS_BUSY, IDM_STATUS_ONLINE,
-    IDM_TOGGLE_SEND_ON_ENTER, IDM_TOGGLE_SOUND, to_wide,
+    IDM_ABOUT, IDM_ADD_MANUAL_PEER, IDM_CANCEL_FILE_TRANSFER, IDM_CLEAR_ALL, IDM_CLEAR_CURRENT,
+    IDM_CONN_INFO, IDM_EXIT, IDM_LOCK_SCREEN, IDM_LOGOUT, IDM_OPTIONS, IDM_REFRESH_NETWORK,
+    IDM_RETRY_SELECTED, IDM_SEARCH, IDM_SEND_FILE, IDM_SHORTCUTS, IDM_SHOW_DETAIL, IDM_STATUS_AWAY,
+    IDM_STATUS_BUSY, IDM_STATUS_ONLINE, IDM_TOGGLE_SEND_ON_ENTER, IDM_TOGGLE_SOUND, to_wide,
 };
 
 pub(crate) struct MenuHandles {
@@ -82,6 +82,9 @@ pub(crate) fn create_main_menu_bar() -> MenuHandles {
         append_popup(bar, edit, "編集・表示(&E)");
 
         // ツール(&T)
+        append_str(tools, IDM_SEND_FILE, "ファイルを送信(&F)...\tCtrl+Shift+F");
+        append_str(tools, IDM_CANCEL_FILE_TRANSFER, "ファイル転送を中止(&Z)");
+        append_sep(tools);
         append_str(tools, IDM_ADD_MANUAL_PEER, "手動ピア追加(&M)...\tCtrl+M");
         append_str(tools, IDM_REFRESH_NETWORK, "ネットワーク再検出(&R)\tF5");
         append_str(tools, IDM_CONN_INFO, "ルーム確認コード・通信情報(&I)...");
@@ -160,6 +163,8 @@ pub(crate) fn sync_menu_enabled_state(hmenu: HMENU, app_state: AppStateKind) {
         IDM_ADD_MANUAL_PEER,
         IDM_REFRESH_NETWORK,
         IDM_CONN_INFO,
+        IDM_SEND_FILE,
+        IDM_CANCEL_FILE_TRANSFER,
     ];
     let is_logged_in = app_state == AppStateKind::LoggedIn;
     let can_logout = matches!(app_state, AppStateKind::LoggedIn | AppStateKind::Locked);

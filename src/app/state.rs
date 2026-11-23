@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
@@ -67,6 +68,18 @@ pub enum UiCommand {
     ClearSessionChat {
         thread: Option<ThreadKey>,
     },
+    SendFile {
+        peer_id: String,
+        file_path: PathBuf,
+    },
+    RespondFileOffer {
+        transfer_id: String,
+        accept: bool,
+        save_path: Option<PathBuf>,
+    },
+    CancelFileTransfer {
+        transfer_id: String,
+    },
     UpdateConfig(LocalConfig),
     LockScreen,
     UnlockScreen {
@@ -105,6 +118,24 @@ impl fmt::Debug for UiCommand {
             Self::ClearSessionChat { thread } => f
                 .debug_struct("ClearSessionChat")
                 .field("thread", thread)
+                .finish(),
+            Self::SendFile { peer_id, file_path } => f
+                .debug_struct("SendFile")
+                .field("peer_id", peer_id)
+                .field("file_path", file_path)
+                .finish(),
+            Self::RespondFileOffer {
+                transfer_id,
+                accept,
+                ..
+            } => f
+                .debug_struct("RespondFileOffer")
+                .field("transfer_id", transfer_id)
+                .field("accept", accept)
+                .finish(),
+            Self::CancelFileTransfer { transfer_id } => f
+                .debug_struct("CancelFileTransfer")
+                .field("transfer_id", transfer_id)
                 .finish(),
             Self::UpdateConfig(cfg) => f.debug_tuple("UpdateConfig").field(cfg).finish(),
             Self::LockScreen => f.write_str("LockScreen"),
@@ -157,6 +188,30 @@ pub enum AppEvent {
     DeliveryUpdated {
         thread: ThreadKey,
         message_id: String,
+    },
+    FileOfferReceived {
+        transfer_id: String,
+        peer_id: String,
+        peer_name: String,
+        filename: String,
+        file_size: u64,
+        sha256_hex: String,
+    },
+    FileTransferProgress {
+        transfer_id: String,
+        peer_id: String,
+        filename: String,
+        is_sending: bool,
+        transferred_bytes: u64,
+        total_bytes: u64,
+    },
+    FileTransferFinished {
+        transfer_id: String,
+        peer_id: String,
+        filename: String,
+        is_sending: bool,
+        ok: bool,
+        message: String,
     },
     NetworkRefreshed {
         nic_info: Option<NicInfo>,
