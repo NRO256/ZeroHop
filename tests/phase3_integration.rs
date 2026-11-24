@@ -177,6 +177,38 @@ async fn encrypted_file_transfer_accept_verify_and_reject_lifecycle() {
         .await
         .unwrap();
 
+    // 256 KiB 未満の転送でも双方で開始時の進捗イベント（転送中止UI有効化）が発行されること
+    match wait_for_event(&rx_a, Duration::from_secs(10), |e| {
+        matches!(e, AppEvent::FileTransferProgress { .. })
+    })
+    .await
+    {
+        AppEvent::FileTransferProgress {
+            is_sending,
+            total_bytes,
+            ..
+        } => {
+            assert!(is_sending);
+            assert_eq!(total_bytes, payload.len() as u64);
+        }
+        _ => unreachable!(),
+    }
+    match wait_for_event(&rx_b, Duration::from_secs(10), |e| {
+        matches!(e, AppEvent::FileTransferProgress { .. })
+    })
+    .await
+    {
+        AppEvent::FileTransferProgress {
+            is_sending,
+            total_bytes,
+            ..
+        } => {
+            assert!(!is_sending);
+            assert_eq!(total_bytes, payload.len() as u64);
+        }
+        _ => unreachable!(),
+    }
+
     // 双方の完了を待機
     match wait_for_event(&rx_a, Duration::from_secs(10), |e| {
         matches!(e, AppEvent::FileTransferFinished { .. })
@@ -262,4 +294,63 @@ async fn encrypted_file_transfer_accept_verify_and_reject_lifecycle() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
     let _ = std::fs::remove_dir_all(&work_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_manual_peer_add_is_rejected_without_ghost_peer() {
+    let dir = temp_base_dir("self_manual");
+    let (node, rx) = spawn_test_node(&dir);
+    let pass = Zeroizing::new("SelfManualPass!".to_string());
+
+    node.cmd_tx
+        .send(UiCommand::LoginRequest {
+            display_name: "Solo".to_string(),
+            password: pass,
+        })
+        .await
+        .unwrap();
+
+    let tcp_port = match wait_for_event(&rx, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::LoginSucceeded { .. })
+    })
+    .await
+    {
+        AppEvent::LoginSucceeded { tcp_port, .. } => tcp_port,
+        _ => unreachable!(),
+    };
+
+    // ループバック（127.0.0.1 / ::1）でも自機ポートへの手動追加は拒否されること
+    node.cmd_tx
+        .send(UiCommand::AddManualPeer {
+            host: "127.0.0.1".to_string(),
+            tcp_port,
+        })
+        .await
+        .unwrap();
+
+    match wait_for_event(&rx, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::ErrorNotice(_))
+    })
+    .await
+    {
+        AppEvent::ErrorNotice(msg) => {
+            assert!(msg.contains("自分自身"), "unexpected message: {msg}");
+        }
+        _ => unreachable!(),
+    }
+
+    // 仮ピアが一覧に追加されていないこと
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::PeerListChanged(peers) = ev {
+            assert!(peers.is_empty(), "ghost peer remained: {peers:?}");
+        }
+    }
+
+    node.cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+    wait_for_event(&rx, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::ShutdownReady)
+    })
+    .await;
+    let _ = node.join_handle.await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

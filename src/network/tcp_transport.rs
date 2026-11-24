@@ -386,7 +386,7 @@ async fn handle_incoming_connection(
         }
         FrameKind::FileChunk => {
             let mut current_header = header;
-            let mut first_transfer_id: Option<String> = None;
+            let mut first_stream_key: Option<(String, String)> = None;
             loop {
                 let mut remaining = vec![0u8; current_header.remaining_len];
                 if let Err(err) =
@@ -401,8 +401,20 @@ async fn handle_incoming_connection(
 
                 match decode_tcp_file_chunk_body(&msg_key, &current_header, &remaining) {
                     Ok((chunk_header, data)) => {
-                        if first_transfer_id.is_none() {
-                            first_transfer_id = Some(chunk_header.transfer_id.clone());
+                        match &first_stream_key {
+                            None => {
+                                first_stream_key = Some((
+                                    chunk_header.transfer_id.clone(),
+                                    chunk_header.sender_id.clone(),
+                                ));
+                            }
+                            Some((tid, sid))
+                                if tid != &chunk_header.transfer_id
+                                    || sid != &chunk_header.sender_id =>
+                            {
+                                break;
+                            }
+                            _ => {}
                         }
                         if tx
                             .send(InboundTcpEvent::FileChunk(InboundTcpFileChunk {
@@ -461,7 +473,7 @@ async fn handle_incoming_connection(
                     }
                 }
             }
-            if let Some(transfer_id) = first_transfer_id {
+            if let Some((transfer_id, _)) = first_stream_key {
                 let _ = tx
                     .send(InboundTcpEvent::FileStreamClosed {
                         peer_ip,

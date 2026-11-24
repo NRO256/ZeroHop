@@ -376,7 +376,7 @@ pub(crate) fn create_main_controls(
         );
         hwnd
     };
-    let initial_byte_guide = format_remaining_bytes_label(0);
+    let initial_byte_guide = format_remaining_bytes_label(0, false);
     let byte_guide = make_ctrl(
         hwnd_parent,
         hinst,
@@ -807,10 +807,10 @@ pub(crate) fn set_notice_text(handles: &UiHandles, state: &mut UiState, text: &s
     }
 }
 
-pub(crate) fn update_input_byte_guide(handles: &UiHandles) {
+pub(crate) fn update_input_byte_guide(handles: &UiHandles, send_on_enter: bool) {
     let text = read_window_text_zeroizing(handles.main_input_edit);
     let utf8_bytes = normalized_utf8_byte_len(&text);
-    let label = format_remaining_bytes_label(utf8_bytes);
+    let label = format_remaining_bytes_label(utf8_bytes, send_on_enter);
     let w = to_wide(&label);
     unsafe {
         SetWindowTextW(handles.main_byte_guide, w.as_ptr());
@@ -1039,7 +1039,7 @@ pub(crate) fn extract_clear_main_args(
 pub(crate) fn apply_clear_main_controls(args: ClearMainControlsArgs) {
     let empty = to_wide("");
     let default_header = to_wide("全体チャット（全員）");
-    let default_guide = to_wide(&format_remaining_bytes_label(0));
+    let default_guide = to_wide(&format_remaining_bytes_label(0, false));
     let sb_parts = [
         "未ログイン",
         "CODE: ------",
@@ -1134,6 +1134,7 @@ pub(crate) fn jump_to_search_hit(thread: ThreadKey, index: usize) {
             state.last_lv_count = 0;
         }
         refresh_peer_list(handles, state);
+        sync_file_transfer_button(handles, state);
         let lv = prepare_virtual_listview_sync(handles, state, false);
         Some((lv, handles.main_chat_list))
     })
@@ -1254,7 +1255,7 @@ pub(crate) fn send_current_input() {
         unsafe {
             SetWindowTextW(handles.main_input_edit, empty.as_ptr());
         }
-        update_input_byte_guide(handles);
+        update_input_byte_guide(handles, state.config.send_on_enter);
         set_notice_text(handles, state, "");
         Some(handles.main_input_edit)
     })
@@ -1353,6 +1354,7 @@ pub(crate) fn open_selected_message_detail(hwnd_parent: HWND) {
     } else {
         focus_control(hwnd_lv);
     }
+    process_pending_file_offers(hwnd_parent);
 }
 
 pub(crate) fn retry_selected_message() {
@@ -1432,7 +1434,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     refresh_peer_list(handles, state);
                     sync_file_transfer_button(handles, state);
                     let lv = prepare_virtual_listview_sync(handles, state, true);
-                    update_input_byte_guide(handles);
+                    update_input_byte_guide(handles, state.config.send_on_enter);
                     set_notice_text(handles, state, "");
                     state.last_focus = handles.main_input_edit;
                     state.sound.mark_login_at(Instant::now());
@@ -1611,7 +1613,10 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         show_main_controls(handles, true);
                         let active_clone = state.active_thread.clone();
                         clear_unread_for_thread(state, &active_clone);
+                        state.total_log_bytes = state.log_reader.total_bytes();
                         refresh_peer_list(handles, state);
+                        sync_file_transfer_button(handles, state);
+                        update_input_byte_guide(handles, state.config.send_on_enter);
                         let lv = prepare_virtual_listview_sync(handles, state, true);
                         state.last_focus = handles.main_input_edit;
                         (lv, handles.main_input_edit)
@@ -1620,6 +1625,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         apply_virtual_listview_sync(lv);
                         focus_control(focus_target);
                     }
+                    process_pending_file_offers(hwnd);
                 } else {
                     let target = with_ui_and_state_mut(|handles, state| {
                         if state.app_state != AppStateKind::Locked {

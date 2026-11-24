@@ -1,4 +1,4 @@
-# ZeroHop v0.3.0
+# ZeroHop v0.3.1
 
 Windows 11 向けの軽量・ポータブル・ゼロパーシステンス暗号化 P2P LAN メッセンジャーです。
 

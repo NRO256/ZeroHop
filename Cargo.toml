@@ -1,6 +1,6 @@
 [package]
 name = "zerohop"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["NRO / Antigravity"]
 edition = "2024"
 description = "Zero-persistence portable encrypted P2P LAN Messenger for Windows 11"

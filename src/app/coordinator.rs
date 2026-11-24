@@ -346,6 +346,22 @@ impl ActiveSession {
         }
     }
 
+    fn is_self_endpoint(&self, ip: IpAddr, port: u16) -> bool {
+        if port != self.tcp_port {
+            return false;
+        }
+        let norm_ip = normalize_ip(ip);
+        if norm_ip == normalize_ip(self.bind_ip) {
+            return true;
+        }
+        if norm_ip.is_loopback() && (self.bind_ip.is_unspecified() || self.bind_ip.is_loopback()) {
+            return true;
+        }
+        self.nic_info
+            .as_ref()
+            .is_some_and(|nic| IpAddr::V4(nic.ip) == norm_ip)
+    }
+
     fn wipe_in_memory(&mut self) {
         self.display_name.zeroize();
         self.ephemeral_peer_id.zeroize();
@@ -1720,7 +1736,7 @@ impl Coordinator {
         let Some(active) = &mut self.active else {
             return;
         };
-        if ip == active.bind_ip && port == active.tcp_port {
+        if active.is_self_endpoint(ip, port) {
             emit_event(
                 &self.event_tx,
                 &self.wake_ui,
@@ -2155,11 +2171,10 @@ impl Coordinator {
         };
         let (nic_info, tcp_port, udp_port) = if self.options.bind_ip_override.is_none() {
             let next_nic = resolve_active_nic_from_str(self.config.preferred_nic_ip.as_deref());
-            if let Some(ref nic) = next_nic {
-                active.udp_target = Some(SocketAddr::new(
-                    IpAddr::V4(nic.broadcast),
-                    self.config.udp_port,
-                ));
+            if self.options.udp_target_override.is_none() {
+                active.udp_target = next_nic
+                    .as_ref()
+                    .map(|nic| SocketAddr::new(IpAddr::V4(nic.broadcast), self.config.udp_port));
             }
             active.nic_info = next_nic.clone();
             (next_nic, active.tcp_port, active.udp_port)
@@ -2350,6 +2365,15 @@ impl Coordinator {
                 ok: false,
                 message: "ファイルの受信を拒否しました".to_string(),
             });
+        } else {
+            self.emit(AppEvent::FileTransferProgress {
+                transfer_id,
+                peer_id: offer.peer_id,
+                filename: offer.filename,
+                is_sending: false,
+                transferred_bytes: 0,
+                total_bytes: offer.file_size,
+            });
         }
     }
 
@@ -2526,7 +2550,9 @@ impl Coordinator {
         }
 
         tr.accepted = true;
+        let peer_id = tr.peer_id.clone();
         let peer_addr = tr.peer_addr;
+        let filename = tr.filename.clone();
         let file_path = tr.file_path.clone();
         let file_size = tr.file_size;
         let cancel_token = tr.cancel_token.clone();
@@ -2534,6 +2560,7 @@ impl Coordinator {
         let Ok(msg_key) = active.keys.with_msg_key(|k| Zeroizing::new(*k)) else {
             return;
         };
+        let init_tid = transfer_id.to_string();
 
         let (prog_tx, mut prog_rx) = mpsc::channel::<u64>(16);
         let tx_prog = internal_tx.clone();
@@ -2575,6 +2602,15 @@ impl Coordinator {
                 })
                 .await;
         });
+
+        self.emit(AppEvent::FileTransferProgress {
+            transfer_id: init_tid,
+            peer_id,
+            filename,
+            is_sending: true,
+            transferred_bytes: 0,
+            total_bytes: file_size,
+        });
     }
 
     fn handle_inbound_file_chunk(&mut self, chunk: InboundTcpFileChunk) {
@@ -2590,6 +2626,25 @@ impl Coordinator {
                 return;
             };
             if tr.peer_id != chunk.header.sender_id {
+                return;
+            }
+            if tr
+                .temp_file
+                .total_plain_bytes()
+                .saturating_add(chunk.data.len() as u64)
+                > tr.expected_size
+            {
+                let removed = active.active_inbound_transfers.remove(&transfer_id);
+                if let Some(r) = removed {
+                    self.emit(AppEvent::FileTransferFinished {
+                        transfer_id,
+                        peer_id: r.peer_id,
+                        filename: r.filename,
+                        is_sending: false,
+                        ok: false,
+                        message: "受信データが宣言サイズを超過したため中断しました".to_string(),
+                    });
+                }
                 return;
             }
             if let Err(err) = tr.temp_file.append_encrypted_chunk(

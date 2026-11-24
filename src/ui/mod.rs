@@ -65,10 +65,10 @@ use main_view::{
     create_lock_controls, create_main_controls, drain_app_events, extract_clear_main_args,
     handle_file_button_clicked, handle_lv_getdispinfo, handle_peer_list_selchange,
     jump_to_search_hit, layout_lock_controls, layout_main_controls, open_selected_message_detail,
-    refresh_peer_list, remove_main_subclasses, remove_tray_icon, retry_selected_message,
-    send_current_input, set_input_send_on_enter, set_notice_text, show_lock_controls,
-    show_main_controls, start_send_file_flow, submit_unlock, update_input_byte_guide,
-    update_status_bar,
+    process_pending_file_offers, refresh_peer_list, remove_main_subclasses, remove_tray_icon,
+    retry_selected_message, send_current_input, set_input_send_on_enter, set_notice_text,
+    show_lock_controls, show_main_controls, start_send_file_flow, submit_unlock,
+    update_input_byte_guide, update_status_bar,
 };
 use menu_bar::{
     create_main_menu_bar, sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check,
@@ -328,10 +328,18 @@ pub(crate) fn format_bytes_human(bytes: usize) -> String {
     }
 }
 
-pub(crate) fn format_remaining_bytes_label(current_utf8_bytes: usize) -> String {
+pub(crate) fn format_remaining_bytes_label(
+    current_utf8_bytes: usize,
+    send_on_enter: bool,
+) -> String {
+    let hint = if send_on_enter {
+        "送信: Enter / 改行: Shift+Enter"
+    } else {
+        "送信: Ctrl+Enter / 改行: Enter"
+    };
     if current_utf8_bytes <= MAX_CHAT_BODY_BYTES {
         let rem = MAX_CHAT_BODY_BYTES - current_utf8_bytes;
-        format!("残り {rem} / {MAX_CHAT_BODY_BYTES} バイト（送信: Ctrl+Enter / 改行: Enter）")
+        format!("残り {rem} / {MAX_CHAT_BODY_BYTES} バイト（{hint}）")
     } else {
         let over = current_utf8_bytes - MAX_CHAT_BODY_BYTES;
         format!("上限を {over} バイト超過しています（最大 {MAX_CHAT_BODY_BYTES} バイト）")
@@ -465,6 +473,7 @@ fn handle_options_modal(hwnd: HWND) {
             || new_cfg.preferred_nic_ip != state.config.preferred_nic_ip;
         state.config = new_cfg.clone();
         set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
+        update_input_byte_guide(handles, state.config.send_on_enter);
         sync_option_menu_checks(handles.hmenu_main, &state.config);
         let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(new_cfg));
         if state.app_state == AppStateKind::LoggedIn {
@@ -487,6 +496,7 @@ fn handle_options_modal(hwnd: HWND) {
     if let Some(target) = focus_target {
         focus_control(target);
     }
+    process_pending_file_offers(hwnd);
 }
 
 fn handle_manual_peer_modal(hwnd: HWND) {
@@ -535,6 +545,7 @@ fn handle_manual_peer_modal(hwnd: HWND) {
     if let Some(target) = focus_target {
         focus_control(target);
     }
+    process_pending_file_offers(hwnd);
 }
 
 fn handle_search_modal(hwnd: HWND) {
@@ -566,6 +577,7 @@ fn handle_search_modal(hwnd: HWND) {
     if let Some((thread, index)) = res.jump_target {
         jump_to_search_hit(thread, index);
     }
+    process_pending_file_offers(hwnd);
 }
 
 fn handle_logout_request(hwnd: HWND) {
@@ -1073,7 +1085,9 @@ unsafe extern "system" fn main_wnd_proc(
                         return 0;
                     }
                     IDC_MAIN_INPUT_EDIT if code == EN_CHANGE => {
-                        with_ui(update_input_byte_guide);
+                        with_ui_and_state(|handles, state| {
+                            update_input_byte_guide(handles, state.config.send_on_enter);
+                        });
                         return 0;
                     }
                     IDC_MAIN_SEND_BTN if code == BN_CLICKED => {
@@ -1141,6 +1155,7 @@ unsafe extern "system" fn main_wnd_proc(
                             state.config.send_on_enter = !state.config.send_on_enter;
                             let next = state.config.clone();
                             set_input_send_on_enter(handles.main_input_edit, next.send_on_enter);
+                            update_input_byte_guide(handles, next.send_on_enter);
                             sync_option_menu_checks(handles.hmenu_main, &next);
                             let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(next));
                         });
@@ -1225,6 +1240,7 @@ unsafe extern "system" fn main_wnd_proc(
                         if let Some((text, dpi)) = info {
                             show_connection_info_dialog(hwnd, &text, dpi);
                             with_state_mut(|s| s.modal_open = false);
+                            process_pending_file_offers(hwnd);
                         }
                         return 0;
                     }
@@ -1240,6 +1256,7 @@ unsafe extern "system" fn main_wnd_proc(
                         if let Some(dpi) = dpi_opt {
                             show_shortcuts_dialog(hwnd, dpi);
                             with_state_mut(|s| s.modal_open = false);
+                            process_pending_file_offers(hwnd);
                         }
                         return 0;
                     }
@@ -1255,6 +1272,7 @@ unsafe extern "system" fn main_wnd_proc(
                         if let Some(dpi) = dpi_opt {
                             show_about_dialog(hwnd, dpi);
                             with_state_mut(|s| s.modal_open = false);
+                            process_pending_file_offers(hwnd);
                         }
                         return 0;
                     }
@@ -1549,8 +1567,12 @@ mod tests {
         assert_eq!(format_bytes_human(512), "512 B");
         assert_eq!(format_bytes_human(1536), "1.5 KB");
         assert_eq!(format_bytes_human(2 * 1024 * 1024), "2.00 MB");
-        assert!(format_remaining_bytes_label(100).contains("3996 / 4096"));
-        assert!(format_remaining_bytes_label(4100).contains("4 バイト超過"));
+        let label_ctrl = format_remaining_bytes_label(100, false);
+        assert!(label_ctrl.contains("3996 / 4096"));
+        assert!(label_ctrl.contains("送信: Ctrl+Enter"));
+        let label_enter = format_remaining_bytes_label(100, true);
+        assert!(label_enter.contains("送信: Enter / 改行: Shift+Enter"));
+        assert!(format_remaining_bytes_label(4100, false).contains("4 バイト超過"));
     }
 
     #[test]
