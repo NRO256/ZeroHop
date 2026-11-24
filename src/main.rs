@@ -12,14 +12,14 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx,
 };
 
-use lan_messenger::crypto;
-use lan_messenger::storage::{
+use zerohop::crypto;
+use zerohop::storage::{
     cache_wipe,
     config::{self, ConfigLoadResult},
     paths::AppPaths,
 };
 
-const SINGLE_INSTANCE_MUTEX: &str = "Local\\NRO_Antigravity_LanMessenger_SingleInstance";
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\NRO_Antigravity_ZeroHop_SingleInstance";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CliFlags {
@@ -133,19 +133,19 @@ mod tests {
     #[test]
     fn cli_flags_detects_multi_case_insensitively() {
         assert_eq!(
-            parse_cli_flags(["LanMessenger.exe"]),
+            parse_cli_flags(["ZeroHop.exe"]),
             CliFlags {
                 multi_instance: false
             }
         );
         assert_eq!(
-            parse_cli_flags(["LanMessenger.exe", "--multi"]),
+            parse_cli_flags(["ZeroHop.exe", "--multi"]),
             CliFlags {
                 multi_instance: true
             }
         );
         assert_eq!(
-            parse_cli_flags(["LanMessenger.exe", "--MULTI"]),
+            parse_cli_flags(["ZeroHop.exe", "--MULTI"]),
             CliFlags {
                 multi_instance: true
             }

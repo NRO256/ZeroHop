@@ -35,9 +35,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use zeroize::Zeroizing;
 
-use lan_messenger::app::state::{AppEvent, AppStateKind, UiCommand};
-use lan_messenger::domain::model::{MAX_MESSAGES_PER_THREAD, ThreadKey};
-use lan_messenger::domain::validation::validate_chat_body;
+use zerohop::app::state::{AppEvent, AppStateKind, UiCommand};
+use zerohop::domain::model::{MAX_MESSAGES_PER_THREAD, ThreadKey};
+use zerohop::domain::validation::validate_chat_body;
 
 use super::a11y::{
     focus_control, focus_listview_item, get_selected_listview_index, safe_disable_window,
@@ -598,7 +598,7 @@ pub(crate) fn create_lock_controls(
         hwnd_parent,
         hinst,
         static_w.as_ptr(),
-        "画面ロック中 - LanMessenger",
+        "画面ロック中 - ZeroHop",
         0,
         static_style,
         IDC_LOCK_TITLE,
@@ -1177,11 +1177,7 @@ fn show_balloon_notification(hwnd: HWND, tray_icon_added: &mut bool, title: &str
     if !*tray_icon_added {
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
-        write_utf16_buf(
-            nid.szTip.as_mut_ptr(),
-            nid.szTip.len() as i32,
-            "LanMessenger",
-        );
+        write_utf16_buf(nid.szTip.as_mut_ptr(), nid.szTip.len() as i32, "ZeroHop");
         unsafe {
             if Shell_NotifyIconW(NIM_ADD, &raw const nid) != 0 {
                 *tray_icon_added = true;
@@ -1414,7 +1410,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     state.tcp_port = tcp_port;
                     state.udp_port = udp_port;
                     state.nic_info = nic_info;
-                    state.status = lan_messenger::domain::model::UserStatus::Online;
+                    state.status = zerohop::domain::model::UserStatus::Online;
                     state.active_thread = ThreadKey::Broadcast;
                     state.peers.clear();
                     state.total_log_bytes = 0;
@@ -1553,7 +1549,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         if !fg {
                             let (title, body) = if state.config.hide_notification_preview {
                                 (
-                                    "LanMessenger".to_string(),
+                                    "ZeroHop".to_string(),
                                     "新着メッセージがあります".to_string(),
                                 )
                             } else {

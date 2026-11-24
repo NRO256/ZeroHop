@@ -501,7 +501,7 @@ mod tests {
         };
         let frame = encode_udp_frame(&beacon_key, &beacon).unwrap();
         assert!(frame.len() <= MAX_UDP_PACKET_BYTES);
-        assert_eq!(&frame[0..4], b"LMSG");
+        assert_eq!(&frame[0..4], b"ZHOP");
         assert_eq!(&frame[4..6], &4u16.to_be_bytes());
 
         let decoded = decode_udp_frame(&beacon_key, &frame).unwrap();

@@ -9,23 +9,23 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
 use zeroize::Zeroizing;
 
-use lan_messenger::app::coordinator::{AppHandle, CoordinatorOptions, spawn_coordinator};
-use lan_messenger::app::state::{AppEvent, UiCommand};
-use lan_messenger::crypto::kdf::{Argon2Params, derive_session_keys_with_params};
-use lan_messenger::domain::model::{DeliveryState, ThreadKey, UserStatus};
-use lan_messenger::domain::protocol::{
+use zerohop::app::coordinator::{AppHandle, CoordinatorOptions, spawn_coordinator};
+use zerohop::app::state::{AppEvent, UiCommand};
+use zerohop::crypto::kdf::{Argon2Params, derive_session_keys_with_params};
+use zerohop::domain::model::{DeliveryState, ThreadKey, UserStatus};
+use zerohop::domain::protocol::{
     TcpPayload, UdpPayload, encode_tcp_control_frame, encode_udp_frame,
 };
-use lan_messenger::network::current_unix_timestamp;
-use lan_messenger::network::tcp_transport::{read_tcp_control_frame, send_tcp_control_frame};
-use lan_messenger::storage::cache_wipe::wipe_cache_dir;
-use lan_messenger::storage::paths::AppPaths;
+use zerohop::network::current_unix_timestamp;
+use zerohop::network::tcp_transport::{read_tcp_control_frame, send_tcp_control_frame};
+use zerohop::storage::cache_wipe::wipe_cache_dir;
+use zerohop::storage::paths::AppPaths;
 
 static INTEG_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn temp_base_dir(name: &str) -> PathBuf {
     let seq = INTEG_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("lmsg_integ_{name}_{}_{seq}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("zhop_integ_{name}_{}_{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

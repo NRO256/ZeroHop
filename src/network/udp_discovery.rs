@@ -476,7 +476,7 @@ mod tests {
         let mut ip_lim = UdpIpRateLimiter::default_udp();
         let mut anom_lim = AnomalyRateLimiter::default_anomaly();
 
-        // 非 LMSG ゴミパケットを15連投しても ip_limiter 枠を消費しない
+        // 非 ZHOP ゴミパケットを15連投しても ip_limiter 枠を消費しない
         for _ in 0..15 {
             assert_eq!(
                 process_udp_datagram(

@@ -307,7 +307,7 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "lmsg_transfer_store_{name}_{}_{seq}",
+            "zhop_transfer_store_{name}_{}_{seq}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

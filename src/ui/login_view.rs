@@ -15,9 +15,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE,
 };
 
-use lan_messenger::app::state::{AppStateKind, UiCommand};
-use lan_messenger::domain::model::MAX_DISPLAY_NAME_CHARS;
-use lan_messenger::domain::validation::{
+use zerohop::app::state::{AppStateKind, UiCommand};
+use zerohop::domain::model::MAX_DISPLAY_NAME_CHARS;
+use zerohop::domain::validation::{
     evaluate_password_strength, validate_and_normalize_display_name, validate_password,
 };
 
@@ -84,7 +84,7 @@ pub(crate) fn create_login_controls(
         hwnd_parent,
         hinst,
         "STATIC",
-        "LanMessenger (LMSG)",
+        "ZeroHop",
         0,
         static_style,
         IDC_LOGIN_TITLE,

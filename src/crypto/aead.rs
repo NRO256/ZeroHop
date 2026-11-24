@@ -64,7 +64,7 @@ mod tests {
         let key = [0x42u8; AEAD_KEY_LEN];
         let other_key = [0x43u8; AEAD_KEY_LEN];
         let nonce = generate_nonce();
-        let aad = b"LMSG\x00\x04";
+        let aad = b"ZHOP\x00\x04";
         let plaintext = b"Secret LAN message";
 
         let ct = encrypt_aead(&key, &nonce, aad, plaintext).unwrap();
@@ -75,7 +75,7 @@ mod tests {
 
         // AAD 改ざん拒否
         assert_eq!(
-            decrypt_aead(&key, &nonce, b"LMSG\x00\x03", &ct),
+            decrypt_aead(&key, &nonce, b"ZHOP\x00\x03", &ct),
             Err(CryptoError::DecryptionFailed)
         );
 

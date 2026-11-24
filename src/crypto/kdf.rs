@@ -12,15 +12,15 @@ use crate::crypto::CryptoError;
 use crate::domain::validation::validate_password;
 use crate::storage::cache_wipe::wipe_cache_dir_best_effort;
 
-pub const ARGON2_SALT: &[u8] = b"LanMessenger-v4-Argon2id-Salt";
+pub const ARGON2_SALT: &[u8] = b"ZeroHop-v4-Argon2id-Salt";
 pub const ARGON2_M_COST_KIB: u32 = 65_536;
 pub const ARGON2_T_COST: u32 = 3;
 pub const ARGON2_P_COST: u32 = 1;
 
-const CONTEXT_MSG_KEY: &str = "LMSG-v4-msg-key";
-const CONTEXT_BEACON_KEY: &str = "LMSG-v4-beacon-key";
-const CONTEXT_ROOM_CODE: &str = "LMSG-v4-room-code";
-const CONTEXT_LOCK_VERIFY: &str = "LMSG-v4-lock-verify";
+const CONTEXT_MSG_KEY: &str = "ZHOP-v4-msg-key";
+const CONTEXT_BEACON_KEY: &str = "ZHOP-v4-beacon-key";
+const CONTEXT_ROOM_CODE: &str = "ZHOP-v4-room-code";
+const CONTEXT_LOCK_VERIFY: &str = "ZHOP-v4-lock-verify";
 
 /// I / O / 0 / 1 を除外した 32文字 Crockford Base32 アルファベット
 const ROOM_CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";

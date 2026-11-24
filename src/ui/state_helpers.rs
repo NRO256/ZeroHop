@@ -12,12 +12,12 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use zeroize::{Zeroize, Zeroizing};
 
-use lan_messenger::app::coordinator::SessionLogReader;
-use lan_messenger::app::state::{AppEvent, AppStateKind, UiCommand};
-use lan_messenger::domain::model::{PeerView, ThreadKey, UserStatus};
-use lan_messenger::network::nic::NicInfo;
-use lan_messenger::storage::config::LocalConfig;
-use lan_messenger::storage::paths::AppPaths;
+use zerohop::app::coordinator::SessionLogReader;
+use zerohop::app::state::{AppEvent, AppStateKind, UiCommand};
+use zerohop::domain::model::{PeerView, ThreadKey, UserStatus};
+use zerohop::network::nic::NicInfo;
+use zerohop::storage::config::LocalConfig;
+use zerohop::storage::paths::AppPaths;
 
 use super::sound::SoundController;
 use super::theme::ThemeResources;

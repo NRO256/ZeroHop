@@ -8,7 +8,7 @@ use windows_sys::Win32::Media::Audio::{
     PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT, SND_SYNC,
 };
 
-use lan_messenger::storage::config::LocalConfig;
+use zerohop::storage::config::LocalConfig;
 
 const SAMPLE_RATE: u32 = 22_050;
 const CHANNELS: u16 = 1;

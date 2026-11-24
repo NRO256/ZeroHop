@@ -6,16 +6,16 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use lan_messenger::app::coordinator::{AppHandle, CoordinatorOptions, spawn_coordinator};
-use lan_messenger::app::state::{AppEvent, UiCommand};
-use lan_messenger::domain::model::ThreadKey;
-use lan_messenger::storage::paths::AppPaths;
+use zerohop::app::coordinator::{AppHandle, CoordinatorOptions, spawn_coordinator};
+use zerohop::app::state::{AppEvent, UiCommand};
+use zerohop::domain::model::ThreadKey;
+use zerohop::storage::paths::AppPaths;
 
 static PH2_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn temp_base_dir(name: &str) -> PathBuf {
     let seq = PH2_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("lmsg_ph2_{name}_{}_{seq}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("zhop_ph2_{name}_{}_{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

@@ -51,7 +51,7 @@ impl AppPaths {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let probe_name = format!(".lmsg_write_probe_{}_{}_{}", std::process::id(), nanos, seq);
+        let probe_name = format!(".zhop_write_probe_{}_{}_{}", std::process::id(), nanos, seq);
         let probe_path = self.base_dir.join(probe_name);
         match OpenOptions::new()
             .write(true)
@@ -79,7 +79,7 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "lmsg_paths_test_{name}_{}_{seq}",
+            "zhop_paths_test_{name}_{}_{seq}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn resolves_portable_paths_under_base_dir() {
-        let base = PathBuf::from(r"C:\Portable\LMSG");
+        let base = PathBuf::from(r"C:\Portable\ZeroHop");
         let paths = AppPaths::from_base_dir(base.clone());
         assert_eq!(paths.base_dir(), base.as_path());
         assert_eq!(paths.config_path(), base.join("config.json"));

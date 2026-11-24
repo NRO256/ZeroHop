@@ -44,13 +44,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use lan_messenger::app::coordinator::{CoordinatorOptions, spawn_coordinator};
-use lan_messenger::app::state::{AppStateKind, UiCommand};
-use lan_messenger::domain::model::{
-    DeliveryState, MAX_CHAT_BODY_BYTES, PeerView, ThreadKey, UserStatus,
-};
-use lan_messenger::storage::config::LocalConfig;
-use lan_messenger::storage::paths::AppPaths;
+use zerohop::app::coordinator::{CoordinatorOptions, spawn_coordinator};
+use zerohop::app::state::{AppStateKind, UiCommand};
+use zerohop::domain::model::{DeliveryState, MAX_CHAT_BODY_BYTES, PeerView, ThreadKey, UserStatus};
+use zerohop::storage::config::LocalConfig;
+use zerohop::storage::paths::AppPaths;
 
 use a11y::{cycle_main_pane_focus, focus_control};
 use dialogs::{
@@ -85,7 +83,7 @@ use theme::{
     center_rect_on_cursor_monitor, is_high_contrast, scale_dpi,
 };
 
-pub(crate) const APP_NAME: &str = "LanMessenger";
+pub(crate) const APP_NAME: &str = "ZeroHop";
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) const WM_APP_EVENT: u32 = WM_APP + 1;
@@ -1427,7 +1425,7 @@ pub(crate) fn run_app(
     startup_notice: Option<String>,
     runtime: &tokio::runtime::Runtime,
 ) -> i32 {
-    let class_name = to_wide("LanMessengerMainWindowClass");
+    let class_name = to_wide("ZeroHopMainWindowClass");
     let hinst = unsafe { GetModuleHandleW(null()) };
 
     let mut wc: WNDCLASSEXW = unsafe { zeroed() };
@@ -1460,9 +1458,9 @@ pub(crate) fn run_app(
     let init_h = scale_dpi(660, sys_dpi);
     let (pos_x, pos_y) = center_rect_on_cursor_monitor(init_w, init_h);
     let title = if multi_instance {
-        to_wide("LanMessenger (LMSG) [マルチ起動]")
+        to_wide("ZeroHop [マルチ起動]")
     } else {
-        to_wide("LanMessenger (LMSG)")
+        to_wide("ZeroHop")
     };
 
     let hwnd = unsafe {
@@ -1617,7 +1615,7 @@ mod tests {
             "絵文字😊と日本語",
             "line1\nline2",
         ] {
-            let expected = lan_messenger::domain::validation::validate_chat_body(sample)
+            let expected = zerohop::domain::validation::validate_chat_body(sample)
                 .unwrap()
                 .len();
             assert_eq!(normalized_utf8_byte_len(sample), expected);

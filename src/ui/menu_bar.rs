@@ -5,9 +5,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
 };
 
-use lan_messenger::app::state::AppStateKind;
-use lan_messenger::domain::model::UserStatus;
-use lan_messenger::storage::config::LocalConfig;
+use zerohop::app::state::AppStateKind;
+use zerohop::domain::model::UserStatus;
+use zerohop::storage::config::LocalConfig;
 
 use super::{
     IDM_ABOUT, IDM_ADD_MANUAL_PEER, IDM_CANCEL_FILE_TRANSFER, IDM_CLEAR_ALL, IDM_CLEAR_CURRENT,

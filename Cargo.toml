@@ -1,5 +1,5 @@
 [package]
-name = "lan-messenger"
+name = "zerohop"
 version = "0.3.0"
 authors = ["NRO / Antigravity"]
 edition = "2024"
@@ -7,11 +7,11 @@ description = "Zero-persistence portable encrypted P2P LAN Messenger for Windows
 license = "MIT"
 
 [lib]
-name = "lan_messenger"
+name = "zerohop"
 path = "src/lib.rs"
 
 [[bin]]
-name = "LanMessenger"
+name = "ZeroHop"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
   <assemblyIdentity
-    version="0.1.0.0"
+    version="0.3.0.0"
     processorArchitecture="*"
-    name="NRO.Antigravity.LanMessenger"
+    name="NRO.Antigravity.ZeroHop"
     type="win32"
   />
-  <description>LanMessenger Zero-Persistence Encrypted P2P LAN Messenger</description>
+  <description>ZeroHop Zero-Persistence Encrypted P2P LAN Messenger</description>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity

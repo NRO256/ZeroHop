@@ -138,7 +138,7 @@ mod tests {
     fn temp_base(name: &str) -> PathBuf {
         let seq = WIPE_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "lmsg_wipe_test_{name}_{}_{seq}",
+            "zhop_wipe_test_{name}_{}_{seq}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

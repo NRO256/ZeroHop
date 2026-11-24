@@ -37,13 +37,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use lan_messenger::app::coordinator::SessionLogReader;
-use lan_messenger::domain::model::{MAX_MAX_MEMORY_MB, MIN_MAX_MEMORY_MB, PeerView, ThreadKey};
-use lan_messenger::domain::session_log::SearchHit;
-use lan_messenger::domain::validation::{ValidationError, validate_manual_peer_endpoint};
-use lan_messenger::network::nic::{NicCandidate, discover_ipv4_nics};
-use lan_messenger::storage::config::LocalConfig;
-use lan_messenger::storage::paths::AppPaths;
+use zerohop::app::coordinator::SessionLogReader;
+use zerohop::domain::model::{MAX_MAX_MEMORY_MB, MIN_MAX_MEMORY_MB, PeerView, ThreadKey};
+use zerohop::domain::session_log::SearchHit;
+use zerohop::domain::validation::{ValidationError, validate_manual_peer_endpoint};
+use zerohop::network::nic::{NicCandidate, discover_ipv4_nics};
+use zerohop::storage::config::LocalConfig;
+use zerohop::storage::paths::AppPaths;
 
 use super::a11y::set_cue_banner;
 use super::theme::{ThemeResources, apply_window_dwm_attributes, center_rect_on_parent, scale_dpi};
@@ -52,7 +52,7 @@ use super::{
     read_window_text, read_window_text_zeroizing, to_wide,
 };
 
-const MODAL_CLASS_NAME: &str = "LanMessengerModalDialogClass";
+const MODAL_CLASS_NAME: &str = "ZeroHopModalDialogClass";
 
 const IDC_DLG_DETAIL_META: usize = 4101;
 const IDC_DLG_DETAIL_BODY: usize = 4102;
@@ -139,9 +139,9 @@ pub(crate) fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> bool {
 }
 
 pub(crate) fn show_single_instance_warning() {
-    let title = to_wide("LanMessenger - 多重起動の確認");
+    let title = to_wide("ZeroHop - 多重起動の確認");
     let msg = to_wide(
-        "LanMessenger はすでに起動しています。\n\
+        "ZeroHop はすでに起動しています。\n\
          同一 PC 上で複数起動してテストする場合は --multi オプションを指定してください。",
     );
     unsafe {
@@ -470,13 +470,13 @@ impl ModalHandler for ConfirmHandler {
 pub(crate) fn confirm_logout_or_exit(parent: HWND, is_exit: bool, dpi: u32) -> bool {
     let (title, body, ok_label) = if is_exit {
         (
-            "終了の確認 - LanMessenger",
+            "終了の確認 - ZeroHop",
             "終了すると、現在の会話内容、暗号鍵、および一時キャッシュはすべて消去され復元できません。\r\nよろしいですか？",
             "全消去して終了(&Y)",
         )
     } else {
         (
-            "ログアウトの確認 - LanMessenger",
+            "ログアウトの確認 - ZeroHop",
             "ログアウトすると、現在の会話内容、暗号鍵、および一時キャッシュはすべて消去され復元できません。\r\nよろしいですか？",
             "ログアウトして全消去(&Y)",
         )
@@ -569,7 +569,7 @@ pub(crate) fn show_message_detail_dialog(
 
     let res = run_modal_dialog(
         parent,
-        "メッセージ全文詳細 - LanMessenger",
+        "メッセージ全文詳細 - ZeroHop",
         600,
         410,
         dpi,
@@ -724,7 +724,7 @@ pub(crate) fn show_add_manual_peer_dialog(
     let port_default = default_port.to_string();
     let res = run_modal_dialog(
         parent,
-        "手動ピア追加 - LanMessenger",
+        "手動ピア追加 - ZeroHop",
         430,
         225,
         dpi,
@@ -1016,7 +1016,7 @@ pub(crate) fn show_options_dialog(
 
     let res = run_modal_dialog(
         parent,
-        "オプション設定 - LanMessenger",
+        "オプション設定 - ZeroHop",
         520,
         520,
         dpi,
@@ -1435,7 +1435,7 @@ fn show_readonly_info_modal(
 pub(crate) fn show_connection_info_dialog(parent: HWND, info_text: &str, dpi: u32) {
     show_readonly_info_modal(
         parent,
-        "ルーム確認コード・通信情報 - LanMessenger",
+        "ルーム確認コード・通信情報 - ZeroHop",
         info_text,
         true,
         true,
@@ -1471,7 +1471,7 @@ pub(crate) fn show_shortcuts_dialog(parent: HWND, dpi: u32) {
   Ctrl + A（入力欄）   : 入力テキストを全選択";
     show_readonly_info_modal(
         parent,
-        "キーボードショートカット一覧 - LanMessenger",
+        "キーボードショートカット一覧 - ZeroHop",
         text,
         false,
         true,
@@ -1617,7 +1617,7 @@ pub(crate) fn show_search_dialog(
 
     let mut res = run_modal_dialog(
         parent,
-        "セッション内メッセージ検索 - LanMessenger",
+        "セッション内メッセージ検索 - ZeroHop",
         620,
         430,
         dpi,
@@ -1764,7 +1764,7 @@ pub(crate) fn show_search_dialog(
 
 pub(crate) fn show_about_dialog(parent: HWND, dpi: u32) {
     let text = format!(
-        "{APP_NAME} (LMSG) v{APP_VERSION}\n\
+        "{APP_NAME} v{APP_VERSION}\n\
          作成者: NRO / Antigravity\n\
          ライセンス: MIT License\n\n\
          [セキュリティ・ゼロパーシステンス方針]\n\
@@ -1780,7 +1780,7 @@ pub(crate) fn show_about_dialog(parent: HWND, dpi: u32) {
     );
     show_readonly_info_modal(
         parent,
-        "バージョン情報 - LanMessenger",
+        "バージョン情報 - ZeroHop",
         &text,
         false,
         false,
@@ -1870,7 +1870,7 @@ pub(crate) fn confirm_file_offer_dialog(
          保存先を指定して受信しますか？"
     );
     let w_msg = to_wide(&msg);
-    let w_title = to_wide("ファイル受信の確認 - LanMessenger");
+    let w_title = to_wide("ファイル受信の確認 - ZeroHop");
     let ret = unsafe {
         MessageBoxW(
             owner,

@@ -272,27 +272,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lan-messenger"
-version = "0.3.0"
-dependencies = [
- "argon2",
- "blake3",
- "chacha20poly1305",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "socket2 0.5.10",
- "subtle",
- "thiserror",
- "tokio",
- "tokio-util",
- "uuid",
- "windows-sys 0.59.0",
- "zeroize",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -795,6 +774,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zerohop"
+version = "0.3.0"
+dependencies = [
+ "argon2",
+ "blake3",
+ "chacha20poly1305",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2 0.5.10",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

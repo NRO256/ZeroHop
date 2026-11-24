@@ -9,7 +9,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::domain::session_log::SessionLog;
 
 pub const CURRENT_PROTOCOL_VERSION: u16 = 4;
-pub const UDP_MAGIC: [u8; 4] = *b"LMSG";
+pub const UDP_MAGIC: [u8; 4] = *b"ZHOP";
 pub const MAX_UDP_PACKET_BYTES: usize = 1200;
 pub const MAX_TCP_CONTROL_FRAME_BYTES: usize = 16 * 1024;
 pub const MAX_TCP_FILE_CHUNK_FRAME_BYTES: usize = 80 * 1024;
