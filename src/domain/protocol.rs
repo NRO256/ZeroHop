@@ -153,6 +153,11 @@ pub enum TcpPayload {
         accepted: bool,
         timestamp: i64,
     },
+    FileCancel {
+        transfer_id: String,
+        sender_id: String,
+        timestamp: i64,
+    },
 }
 
 /// TCP frame_kind = 0x02 の復号後先頭メタヘッダ（直後に生チャンクバイト列）

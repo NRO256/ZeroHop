@@ -354,3 +354,160 @@ async fn self_manual_peer_add_is_rejected_without_ghost_peer() {
     let _ = node.join_handle.await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_cancel_from_receiver_notifies_sender_and_shreds_temp() {
+    let dir_a = temp_base_dir("cancel_a");
+    let dir_b = temp_base_dir("cancel_b");
+    let work_dir = temp_base_dir("cancel_work");
+
+    let (node_a, rx_a) = spawn_test_node(&dir_a);
+    let (node_b, rx_b) = spawn_test_node(&dir_b);
+
+    let pass = Zeroizing::new("Phase3CancelPass!".to_string());
+    node_a
+        .cmd_tx
+        .send(UiCommand::LoginRequest {
+            display_name: "Alice".to_string(),
+            password: pass.clone(),
+        })
+        .await
+        .unwrap();
+    node_b
+        .cmd_tx
+        .send(UiCommand::LoginRequest {
+            display_name: "Bob".to_string(),
+            password: pass,
+        })
+        .await
+        .unwrap();
+
+    let (id_a, _) = match wait_for_event(&rx_a, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::LoginSucceeded { .. })
+    })
+    .await
+    {
+        AppEvent::LoginSucceeded {
+            ephemeral_peer_id,
+            tcp_port,
+            ..
+        } => (ephemeral_peer_id, tcp_port),
+        _ => unreachable!(),
+    };
+    let (id_b, port_b) = match wait_for_event(&rx_b, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::LoginSucceeded { .. })
+    })
+    .await
+    {
+        AppEvent::LoginSucceeded {
+            ephemeral_peer_id,
+            tcp_port,
+            ..
+        } => (ephemeral_peer_id, tcp_port),
+        _ => unreachable!(),
+    };
+
+    node_a
+        .cmd_tx
+        .send(UiCommand::AddManualPeer {
+            host: "127.0.0.1".to_string(),
+            tcp_port: port_b,
+        })
+        .await
+        .unwrap();
+    wait_for_event(&rx_a, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::PeerListChanged(list) if list.iter().any(|p| p.peer_id == id_b && p.is_online))
+    })
+    .await;
+    wait_for_event(&rx_b, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::PeerListChanged(list) if list.iter().any(|p| p.peer_id == id_a && p.is_online))
+    })
+    .await;
+
+    let src_path = work_dir.join("large_cancel.bin");
+    let payload = vec![0x5Au8; 4 * 1024 * 1024];
+    std::fs::write(&src_path, &payload).unwrap();
+
+    node_a
+        .cmd_tx
+        .send(UiCommand::SendFile {
+            peer_id: id_b.clone(),
+            file_path: src_path,
+        })
+        .await
+        .unwrap();
+
+    let offer_id = match wait_for_event(&rx_b, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::FileOfferReceived { .. })
+    })
+    .await
+    {
+        AppEvent::FileOfferReceived { transfer_id, .. } => transfer_id,
+        _ => unreachable!(),
+    };
+
+    let dest_path = work_dir.join("never_saved.bin");
+    node_b
+        .cmd_tx
+        .send(UiCommand::RespondFileOffer {
+            transfer_id: offer_id.clone(),
+            accept: true,
+            save_path: Some(dest_path.clone()),
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&rx_b, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::FileTransferProgress { .. })
+    })
+    .await;
+
+    node_b
+        .cmd_tx
+        .send(UiCommand::CancelFileTransfer {
+            transfer_id: offer_id,
+        })
+        .await
+        .unwrap();
+
+    match wait_for_event(&rx_b, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::FileTransferFinished { .. })
+    })
+    .await
+    {
+        AppEvent::FileTransferFinished { ok, .. } => assert!(!ok),
+        _ => unreachable!(),
+    }
+
+    match wait_for_event(&rx_a, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::FileTransferFinished { .. })
+    })
+    .await
+    {
+        AppEvent::FileTransferFinished { ok, is_sending, .. } => {
+            assert!(!ok);
+            assert!(is_sending);
+        }
+        _ => unreachable!(),
+    }
+
+    assert!(!dest_path.exists());
+    assert!(!dir_b.join("cache").exists());
+
+    node_a.cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+    node_b.cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+    wait_for_event(&rx_a, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::ShutdownReady)
+    })
+    .await;
+    wait_for_event(&rx_b, Duration::from_secs(5), |e| {
+        matches!(e, AppEvent::ShutdownReady)
+    })
+    .await;
+    let _ = node_a.join_handle.await;
+    let _ = node_b.join_handle.await;
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&work_dir);
+}

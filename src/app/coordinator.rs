@@ -53,6 +53,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 128;
 const INTERNAL_CHANNEL_CAPACITY: usize = 256;
 const MAX_PEER_SEQ_TRACKED: usize = 512;
 const PEER_SEQ_TTL_SECS: i64 = DEFAULT_TIMESTAMP_WINDOW_SECS * 2;
+const MAX_PENDING_FILE_OFFERS: usize = 16;
 
 struct PeerSeqTracker {
     entries: HashMap<String, (u64, i64)>,
@@ -113,6 +114,12 @@ impl Drop for PeerSeqTracker {
     }
 }
 
+pub enum TryReadMessage<R> {
+    Hit(R),
+    Empty,
+    Contended,
+}
+
 #[derive(Clone)]
 pub struct SessionLogReader {
     inner: Arc<RwLock<SessionLog>>,
@@ -138,6 +145,21 @@ impl SessionLogReader {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.get_message(thread, index).map(f)
+    }
+
+    pub fn try_with_message<R>(
+        &self,
+        thread: &ThreadKey,
+        index: usize,
+        f: impl FnOnce(&InMemoryChatMessage) -> R,
+    ) -> TryReadMessage<R> {
+        let Ok(guard) = self.inner.try_read() else {
+            return TryReadMessage::Contended;
+        };
+        match guard.get_message(thread, index) {
+            Some(msg) => TryReadMessage::Hit(f(msg)),
+            None => TryReadMessage::Empty,
+        }
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -279,6 +301,7 @@ struct PendingInboundOffer {
 
 struct ActiveInboundTransfer {
     peer_id: String,
+    peer_addr: SocketAddr,
     filename: String,
     expected_size: u64,
     expected_sha256_hex: String,
@@ -1715,6 +1738,19 @@ impl Coordinator {
                     internal_tx,
                 );
             }
+            TcpPayload::FileCancel {
+                transfer_id,
+                sender_id,
+                timestamp,
+            } => {
+                self.handle_inbound_file_cancel(
+                    msg.peer_ip,
+                    transfer_id,
+                    sender_id,
+                    *timestamp,
+                    now_unix,
+                );
+            }
         }
     }
 
@@ -2323,6 +2359,7 @@ impl Coordinator {
                         transfer_id.clone(),
                         ActiveInboundTransfer {
                             peer_id: offer.peer_id.clone(),
+                            peer_addr: offer.peer_addr,
                             filename: offer.filename.clone(),
                             expected_size: offer.file_size,
                             expected_sha256_hex: offer.sha256_hex.clone(),
@@ -2383,6 +2420,17 @@ impl Coordinator {
         };
         if let Some(tr) = active.outbound_transfers.remove(transfer_id) {
             tr.cancel_token.cancel();
+            if let Ok(msg_key) = active.keys.with_msg_key(|k| Zeroizing::new(*k)) {
+                let cancel_msg = TcpPayload::FileCancel {
+                    transfer_id: transfer_id.to_string(),
+                    sender_id: active.ephemeral_peer_id.clone(),
+                    timestamp: current_unix_timestamp(),
+                };
+                let peer_addr = tr.peer_addr;
+                active.outbound_tasks.spawn(async move {
+                    let _ = send_tcp_control_frame(peer_addr, &msg_key, &cancel_msg).await;
+                });
+            }
             self.emit(AppEvent::FileTransferFinished {
                 transfer_id: transfer_id.to_string(),
                 peer_id: tr.peer_id,
@@ -2395,8 +2443,19 @@ impl Coordinator {
         }
         if let Some(tr) = active.active_inbound_transfers.remove(transfer_id) {
             let peer_id = tr.peer_id.clone();
+            let peer_addr = tr.peer_addr;
             let filename = tr.filename.clone();
             drop(tr);
+            if let Ok(msg_key) = active.keys.with_msg_key(|k| Zeroizing::new(*k)) {
+                let cancel_msg = TcpPayload::FileCancel {
+                    transfer_id: transfer_id.to_string(),
+                    sender_id: active.ephemeral_peer_id.clone(),
+                    timestamp: current_unix_timestamp(),
+                };
+                active.outbound_tasks.spawn(async move {
+                    let _ = send_tcp_control_frame(peer_addr, &msg_key, &cancel_msg).await;
+                });
+            }
             self.emit(AppEvent::FileTransferFinished {
                 transfer_id: transfer_id.to_string(),
                 peer_id,
@@ -2461,8 +2520,10 @@ impl Coordinator {
         };
         let peer_addr = SocketAddr::new(peer.ip, peer.tcp_port);
 
-        // 画面ロック中等は自動拒否してUIモーダルを出さない
-        if self.state != AppStateKind::LoggedIn {
+        // 画面ロック中等または未承諾オファー上限超過時は自動拒否してUIモーダルを出さない
+        if self.state != AppStateKind::LoggedIn
+            || active.pending_inbound_offers.len() >= MAX_PENDING_FILE_OFFERS
+        {
             if let Ok(msg_key) = active.keys.with_msg_key(|k| Zeroizing::new(*k)) {
                 let response = TcpPayload::FileResponse {
                     transfer_id: transfer_id.to_string(),
@@ -2496,6 +2557,81 @@ impl Coordinator {
             file_size,
             sha256_hex: clean_sha256,
         });
+    }
+
+    fn handle_inbound_file_cancel(
+        &mut self,
+        peer_ip: IpAddr,
+        transfer_id: &str,
+        sender_id: &str,
+        timestamp: i64,
+        now_unix: i64,
+    ) {
+        if validate_identifier(transfer_id).is_err() || validate_identifier(sender_id).is_err() {
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        if let Err(skew_seconds) =
+            check_timestamp_window(timestamp, now_unix, DEFAULT_TIMESTAMP_WINDOW_SECS)
+        {
+            if allow_anomaly_for(active, peer_ip) {
+                self.emit(AppEvent::ClockSkewDetected {
+                    peer_ip,
+                    skew_seconds,
+                });
+            }
+            return;
+        }
+
+        if let Some(tr) = active.outbound_transfers.get(transfer_id)
+            && tr.peer_id == sender_id
+            && let Some(removed) = active.outbound_transfers.remove(transfer_id)
+        {
+            removed.cancel_token.cancel();
+            self.emit(AppEvent::FileTransferFinished {
+                transfer_id: transfer_id.to_string(),
+                peer_id: removed.peer_id,
+                filename: removed.filename,
+                is_sending: true,
+                ok: false,
+                message: "相手側によりファイル転送が中止されました".to_string(),
+            });
+            return;
+        }
+
+        if let Some(tr) = active.active_inbound_transfers.get(transfer_id)
+            && tr.peer_id == sender_id
+            && let Some(removed) = active.active_inbound_transfers.remove(transfer_id)
+        {
+            let peer_id = removed.peer_id.clone();
+            let filename = removed.filename.clone();
+            drop(removed);
+            self.emit(AppEvent::FileTransferFinished {
+                transfer_id: transfer_id.to_string(),
+                peer_id,
+                filename,
+                is_sending: false,
+                ok: false,
+                message: "送信側によりファイル転送が中止されました".to_string(),
+            });
+            return;
+        }
+
+        if let Some(offer) = active.pending_inbound_offers.get(transfer_id)
+            && offer.peer_id == sender_id
+            && let Some(removed) = active.pending_inbound_offers.remove(transfer_id)
+        {
+            self.emit(AppEvent::FileTransferFinished {
+                transfer_id: transfer_id.to_string(),
+                peer_id: removed.peer_id,
+                filename: removed.filename,
+                is_sending: false,
+                ok: false,
+                message: "送信側によりファイル送信要求が取り消されました".to_string(),
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

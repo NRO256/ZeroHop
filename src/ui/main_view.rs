@@ -35,6 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use zeroize::Zeroizing;
 
+use zerohop::app::coordinator::TryReadMessage;
 use zerohop::app::state::{AppEvent, AppStateKind, UiCommand};
 use zerohop::domain::model::{MAX_MESSAGES_PER_THREAD, ThreadKey};
 use zerohop::domain::validation::validate_chat_body;
@@ -1070,9 +1071,10 @@ pub(crate) fn handle_lv_getdispinfo(lparam: LPARAM, state: &UiState) {
     }
     let row = di.item.iItem as usize;
     let col = di.item.iSubItem;
-    let text_opt = state
+    let hwnd_lv = di.hdr.hwndFrom;
+    match state
         .log_reader
-        .with_message(&state.active_thread, row, |m| {
+        .try_with_message(&state.active_thread, row, |m| {
             Zeroizing::new(match col {
                 0 => m.sender_name.clone(),
                 1 => format_unix_time_hms(m.timestamp),
@@ -1080,9 +1082,17 @@ pub(crate) fn handle_lv_getdispinfo(lparam: LPARAM, state: &UiState) {
                 3 => m.delivery.status_label(),
                 _ => String::new(),
             })
-        });
-    if let Some(text) = text_opt {
-        write_utf16_buf(di.item.pszText, di.item.cchTextMax, &text);
+        }) {
+        TryReadMessage::Hit(text) => write_utf16_buf(di.item.pszText, di.item.cchTextMax, &text),
+        TryReadMessage::Empty => write_utf16_buf(di.item.pszText, di.item.cchTextMax, ""),
+        TryReadMessage::Contended => {
+            write_utf16_buf(di.item.pszText, di.item.cchTextMax, "");
+            if !hwnd_lv.is_null() {
+                unsafe {
+                    let _ = InvalidateRect(hwnd_lv, null(), 0);
+                }
+            }
+        }
     }
 }
 
