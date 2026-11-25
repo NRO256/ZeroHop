@@ -1,5 +1,5 @@
 ======================================================================
-  ZeroHop v0.3.1 - ご利用案内 (README)
+  ZeroHop v0.3.2 - ご利用案内 (README)
   作成者: NRO / Antigravity
   ライセンス: MIT License (同梱の LICENSE を参照)
   対象 OS: Windows 11 (x86_64)

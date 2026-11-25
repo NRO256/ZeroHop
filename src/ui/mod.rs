@@ -2,12 +2,17 @@
 
 pub mod a11y;
 pub mod dialogs;
+pub mod events;
+pub mod formats;
+pub mod lock_view;
 pub mod login_view;
 pub mod main_view;
 pub mod menu_bar;
+pub mod shortcuts;
 pub mod sound;
 pub mod state_helpers;
 pub mod theme;
+pub mod transfer_ui;
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::{size_of, zeroed};
@@ -16,22 +21,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc::error::TrySendError;
-use windows_sys::Win32::Foundation::{
-    FILETIME, GetLastError, HWND, LPARAM, LRESULT, RECT, SYSTEMTIME, WPARAM,
-};
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetSysColorBrush, InvalidateRect, SetBkColor, SetTextColor,
+    COLOR_BTNFACE, GetSysColorBrush, HFONT, InvalidateRect, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
-use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_DELETE, VK_F5, VK_F6,
-    VK_MENU, VK_RETURN, VK_SHIFT,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetLastInputInfo, LASTINPUTINFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, GetClientRect, GetMessageW, IDC_ARROW,
@@ -39,40 +36,45 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
     SetMenu, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
     WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
+    WM_GETMINMAXINFO, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
+    WNDCLASSEXW, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
 };
 use zeroize::{Zeroize, Zeroizing};
 
 use zerohop::app::coordinator::{CoordinatorOptions, spawn_coordinator};
 use zerohop::app::state::{AppStateKind, UiCommand};
-use zerohop::domain::model::{DeliveryState, MAX_CHAT_BODY_BYTES, PeerView, ThreadKey, UserStatus};
+use zerohop::domain::model::{ThreadKey, UserStatus};
 use zerohop::storage::config::LocalConfig;
 use zerohop::storage::paths::AppPaths;
 
-use a11y::{cycle_main_pane_focus, focus_control};
+use a11y::focus_control;
 use dialogs::{
     confirm_logout_or_exit, show_about_dialog, show_add_manual_peer_dialog,
     show_connection_info_dialog, show_options_dialog, show_search_dialog, show_shortcuts_dialog,
 };
+use events::{drain_app_events, remove_tray_icon};
+pub(crate) use formats::{
+    build_connection_info_text, format_bytes_human, format_remaining_bytes_label,
+    format_unix_datetime, format_unix_time_hms, is_message_retryable, normalize_crlf,
+    normalized_utf8_byte_len, resolve_migrated_thread, summarize_message_body,
+};
+use lock_view::{create_lock_controls, layout_lock_controls, show_lock_controls, submit_unlock};
 use login_view::{
     create_login_controls, layout_login_controls, reset_login_form, set_authenticating_ui,
     set_login_status_message, show_login_controls, submit_login, toggle_password_visibility,
     update_password_guide,
 };
 use main_view::{
-    apply_clear_main_controls, cancel_active_file_transfer, clear_unread_for_thread,
-    create_lock_controls, create_main_controls, drain_app_events, extract_clear_main_args,
-    handle_file_button_clicked, handle_lv_getdispinfo, handle_peer_list_selchange,
-    jump_to_search_hit, layout_lock_controls, layout_main_controls, open_selected_message_detail,
-    process_pending_file_offers, refresh_peer_list, remove_main_subclasses, remove_tray_icon,
+    apply_clear_main_controls, clear_unread_for_thread, create_main_controls,
+    extract_clear_main_args, handle_lv_getdispinfo, handle_peer_list_selchange, jump_to_search_hit,
+    layout_main_controls, open_selected_message_detail, refresh_peer_list, remove_main_subclasses,
     retry_selected_message, send_current_input, set_input_send_on_enter, set_notice_text,
-    show_lock_controls, show_main_controls, start_send_file_flow, submit_unlock,
-    update_input_byte_guide, update_status_bar,
+    show_main_controls, update_input_byte_guide, update_status_bar,
 };
 use menu_bar::{
     create_main_menu_bar, sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check,
 };
+use shortcuts::handle_global_shortcut;
 use sound::SoundController;
 use state_helpers::{
     UiHandles, UiState, clear_thread_locals, guard_wnd_proc, init_thread_locals, with_state,
@@ -81,6 +83,10 @@ use state_helpers::{
 use theme::{
     CLR_NOTICE_TEXT, ThemeResources, apply_listview_explorer_theme, apply_window_dwm_attributes,
     center_rect_on_cursor_monitor, is_high_contrast, scale_dpi,
+};
+use transfer_ui::{
+    cancel_active_file_transfer, handle_file_button_clicked, process_pending_file_offers,
+    start_send_file_flow,
 };
 
 pub(crate) const APP_NAME: &str = "ZeroHop";
@@ -154,6 +160,38 @@ pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_child_control(
+    parent: HWND,
+    hinst: HANDLE,
+    class_w: *const u16,
+    text: &str,
+    ex_style: u32,
+    style: u32,
+    id: usize,
+    font: HFONT,
+) -> HWND {
+    let txt_w = to_wide(text);
+    unsafe {
+        let hwnd = CreateWindowExW(
+            ex_style,
+            class_w,
+            txt_w.as_ptr(),
+            style,
+            0,
+            0,
+            100,
+            24,
+            parent,
+            id as _,
+            hinst,
+            null_mut(),
+        );
+        SendMessageW(hwnd, WM_SETFONT, font as usize, 1);
+        hwnd
+    }
+}
+
 pub(crate) fn write_utf16_buf(dst: *mut u16, cap: i32, text: &str) {
     if dst.is_null() || cap <= 0 {
         return;
@@ -225,165 +263,6 @@ pub(crate) fn read_window_text_zeroizing(hwnd: HWND) -> Zeroizing<String> {
     }
 }
 
-pub(crate) fn normalized_utf8_byte_len(raw: &str) -> usize {
-    let mut bytes = 0usize;
-    let mut prev_cr = false;
-    for ch in raw.chars() {
-        if ch == '\r' {
-            bytes += 1;
-            prev_cr = true;
-            continue;
-        }
-        if ch == '\n' {
-            if prev_cr {
-                prev_cr = false;
-                continue;
-            }
-            bytes += 1;
-            continue;
-        }
-        prev_cr = false;
-        if ch == '\t' || !ch.is_control() {
-            bytes += ch.len_utf8();
-        }
-    }
-    bytes
-}
-
-fn unix_ts_to_local_systemtime(ts: i64) -> Option<SYSTEMTIME> {
-    if ts < 0 {
-        return None;
-    }
-    const WINDOWS_TO_UNIX_EPOCH_SECS: i64 = 11_644_473_600;
-    let shifted = ts.checked_add(WINDOWS_TO_UNIX_EPOCH_SECS)?;
-    if shifted < 0 {
-        return None;
-    }
-    let intervals_100ns = u64::try_from(shifted).ok()?.checked_mul(10_000_000)?;
-    let ft = FILETIME {
-        dwLowDateTime: (intervals_100ns & 0xFFFF_FFFF) as u32,
-        dwHighDateTime: (intervals_100ns >> 32) as u32,
-    };
-    let mut utc_st: SYSTEMTIME = unsafe { zeroed() };
-    let mut local_st: SYSTEMTIME = unsafe { zeroed() };
-    unsafe {
-        if FileTimeToSystemTime(&raw const ft, &raw mut utc_st) == 0 {
-            return None;
-        }
-        if SystemTimeToTzSpecificLocalTime(null(), &raw const utc_st, &raw mut local_st) == 0 {
-            return Some(utc_st);
-        }
-    }
-    Some(local_st)
-}
-
-pub(crate) fn format_unix_time_hms(ts: i64) -> String {
-    if let Some(st) = unix_ts_to_local_systemtime(ts) {
-        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
-    } else if ts >= 0 {
-        let day_secs = ts % 86_400;
-        let h = day_secs / 3_600;
-        let m = (day_secs % 3_600) / 60;
-        let s = day_secs % 60;
-        format!("{h:02}:{m:02}:{s:02}")
-    } else {
-        "--:--:--".to_string()
-    }
-}
-
-pub(crate) fn format_unix_datetime(ts: i64) -> String {
-    if let Some(st) = unix_ts_to_local_systemtime(ts) {
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
-        )
-    } else {
-        format!("UNIX:{ts}")
-    }
-}
-
-pub(crate) fn summarize_message_body(body: &str, max_chars: usize) -> String {
-    let single = body.replace("\r\n", " / ").replace('\n', " / ");
-    let has_nl = body.contains('\n');
-    let count = single.chars().count();
-    if has_nl || count > max_chars {
-        let head: String = single.chars().take(max_chars).collect();
-        format!("{head}… [Enterで全文]")
-    } else {
-        single
-    }
-}
-
-pub(crate) fn normalize_crlf(body: &str) -> String {
-    body.replace("\r\n", "\n").replace('\n', "\r\n")
-}
-
-pub(crate) fn format_bytes_human(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
-pub(crate) fn format_remaining_bytes_label(
-    current_utf8_bytes: usize,
-    send_on_enter: bool,
-) -> String {
-    let hint = if send_on_enter {
-        "送信: Enter / 改行: Shift+Enter"
-    } else {
-        "送信: Ctrl+Enter / 改行: Enter"
-    };
-    if current_utf8_bytes <= MAX_CHAT_BODY_BYTES {
-        let rem = MAX_CHAT_BODY_BYTES - current_utf8_bytes;
-        format!("残り {rem} / {MAX_CHAT_BODY_BYTES} バイト（{hint}）")
-    } else {
-        let over = current_utf8_bytes - MAX_CHAT_BODY_BYTES;
-        format!("上限を {over} バイト超過しています（最大 {MAX_CHAT_BODY_BYTES} バイト）")
-    }
-}
-
-pub(crate) fn is_message_retryable(delivery: &DeliveryState) -> bool {
-    match delivery {
-        DeliveryState::DirectFailed | DeliveryState::DirectSending => true,
-        DeliveryState::Broadcast {
-            target_count,
-            acked_peers,
-            failed_peers,
-        } => *target_count > 0 && (!failed_peers.is_empty() || acked_peers.len() < *target_count),
-        DeliveryState::Received | DeliveryState::DirectDelivered => false,
-    }
-}
-
-pub(crate) fn resolve_migrated_thread(current: &ThreadKey, new_peers: &[PeerView]) -> ThreadKey {
-    let ThreadKey::Peer(cur_id) = current else {
-        return ThreadKey::Broadcast;
-    };
-    if new_peers.iter().any(|p| &p.peer_id == cur_id) {
-        return current.clone();
-    }
-    if let Some(rest) = cur_id.strip_prefix("manual:")
-        && let Some((ip_part, port_part)) = rest.rsplit_once(':')
-        && let Ok(port) = port_part.parse::<u16>()
-        && let Some(formal) = new_peers
-            .iter()
-            .find(|p| p.ip_text == ip_part && p.tcp_port == port)
-    {
-        return ThreadKey::Peer(formal.peer_id.clone());
-    }
-    ThreadKey::Broadcast
-}
-
-pub(crate) fn get_process_working_set_bytes() -> Option<usize> {
-    let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
-    pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &raw mut pmc, pmc.cb) };
-    (ok != 0).then_some(pmc.WorkingSetSize)
-}
-
 struct PendingWindowInit {
     paths: AppPaths,
     config: LocalConfig,
@@ -393,191 +272,144 @@ struct PendingWindowInit {
     join_slot: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
-fn build_connection_info_text(state: &UiState) -> String {
-    let ws = get_process_working_set_bytes()
-        .map(format_bytes_human)
-        .unwrap_or_else(|| "計測不可".to_string());
-    let nic_desc = match &state.nic_info {
-        Some(n) => format!(
-            "{} ({}) / {} (Broadcast: {})",
-            n.friendly_name, n.description, n.ip, n.broadcast
-        ),
-        None => "物理NIC未検出 / 既定バインド".to_string(),
-    };
-    let mode_label = if state.multi_instance {
-        "多重起動許可 (--multi)"
-    } else {
-        "標準単一起動"
-    };
-
-    let mut lines = vec![
-        format!("表示名: {}", state.display_name),
-        format!("現在の状態: {}", state.status.label_ja()),
-        format!("起動モード: {mode_label}"),
-        format!("ルーム確認コード: {}", state.room_code),
-        format!("エフェメラル端末ID: {}", state.ephemeral_peer_id),
-        format!("使用NIC: {nic_desc}"),
-        format!(
-            "待受ポート: TCP {} / UDP {}",
-            state.tcp_port, state.udp_port
-        ),
-        format!(
-            "会話ログ使用量: {} / 上限 {} MiB",
-            format_bytes_human(state.total_log_bytes),
-            state.config.max_memory_mb
-        ),
-        format!("プロセス Working Set: {ws}"),
-        String::new(),
-        format!("検出・追加済みピア ({}件):", state.peers.len()),
-    ];
-    if state.peers.is_empty() {
-        lines.push("  （なし）".to_string());
-    } else {
-        for p in &state.peers {
-            lines.push(format!(
-                "  - {} ({}:{}) [{}] ID:{}",
-                p.display_name,
-                p.ip_text,
-                p.tcp_port,
-                if p.is_online {
-                    p.status.label_ja()
-                } else {
-                    "オフライン"
-                },
-                p.short_id
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-fn handle_options_modal(hwnd: HWND) {
-    let snapshot = with_state_mut(|s| {
+fn run_guarded_modal<Snap, Res, Post>(
+    hwnd: HWND,
+    prepare: impl FnOnce(&mut UiState) -> Option<Snap>,
+    show: impl FnOnce(Snap) -> Res,
+    finish: impl FnOnce(&mut UiHandles, &mut UiState, Res) -> Post,
+    after: impl FnOnce(Post),
+) {
+    let Some(snap) = with_state_mut(|s| {
         if s.modal_open {
             return None;
         }
+        let snap = prepare(s)?;
         s.modal_open = true;
-        Some((s.config.clone(), s.paths.clone(), s.dpi))
+        Some(snap)
     })
-    .flatten();
-    let Some((cfg, paths, dpi)) = snapshot else {
+    .flatten() else {
         return;
     };
 
-    let updated = show_options_dialog(hwnd, &cfg, &paths, dpi);
-    let focus_target = with_ui_and_state_mut(|handles, state| {
+    let res = show(snap);
+    let post = with_ui_and_state_mut(|handles, state| {
         state.modal_open = false;
-        let new_cfg = updated?;
-        let port_or_nic_changed = new_cfg.udp_port != state.config.udp_port
-            || new_cfg.tcp_port != state.config.tcp_port
-            || new_cfg.preferred_nic_ip != state.config.preferred_nic_ip;
-        state.config = new_cfg.clone();
-        set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
-        update_input_byte_guide(handles, state.config.send_on_enter);
-        sync_option_menu_checks(handles.hmenu_main, &state.config);
-        let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(new_cfg));
-        if state.app_state == AppStateKind::LoggedIn {
-            if port_or_nic_changed {
-                set_notice_text(
-                    handles,
-                    state,
-                    "設定を保存しました。ポート変更は次回ログイン時、NIC設定は「ネットワーク再検出」で反映されます。",
-                );
-            } else {
-                set_notice_text(handles, state, "オプション設定を反映しました。");
-            }
-            Some(handles.main_input_edit)
-        } else {
-            set_login_status_message(handles, "オプション設定を更新しました。");
-            Some(handles.login_name_edit)
-        }
-    })
-    .flatten();
-    if let Some(target) = focus_target {
-        focus_control(target);
+        finish(handles, state, res)
+    });
+    if let Some(p) = post {
+        after(p);
     }
     process_pending_file_offers(hwnd);
+}
+
+fn handle_options_modal(hwnd: HWND) {
+    run_guarded_modal(
+        hwnd,
+        |s| Some((s.config.clone(), s.paths.clone(), s.dpi)),
+        |(cfg, paths, dpi)| show_options_dialog(hwnd, &cfg, &paths, dpi),
+        |handles, state, updated| {
+            let new_cfg = updated?;
+            let port_or_nic_changed = new_cfg.udp_port != state.config.udp_port
+                || new_cfg.tcp_port != state.config.tcp_port
+                || new_cfg.preferred_nic_ip != state.config.preferred_nic_ip;
+            state.config = new_cfg.clone();
+            set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
+            update_input_byte_guide(handles, state.config.send_on_enter);
+            sync_option_menu_checks(handles.hmenu_main, &state.config);
+            let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(new_cfg));
+            if state.app_state == AppStateKind::LoggedIn {
+                if port_or_nic_changed {
+                    set_notice_text(
+                        handles,
+                        state,
+                        "設定を保存しました。ポート変更は次回ログイン時、NIC設定は「ネットワーク再検出」で反映されます。",
+                    );
+                } else {
+                    set_notice_text(handles, state, "オプション設定を反映しました。");
+                }
+                Some(handles.main_input_edit)
+            } else {
+                set_login_status_message(handles, "オプション設定を更新しました。");
+                Some(handles.login_name_edit)
+            }
+        },
+        |target_opt| {
+            if let Some(target) = target_opt {
+                focus_control(target);
+            }
+        },
+    );
 }
 
 fn handle_manual_peer_modal(hwnd: HWND) {
-    let snapshot = with_state_mut(|s| {
-        if s.modal_open || s.app_state != AppStateKind::LoggedIn {
-            return None;
-        }
-        s.modal_open = true;
-        Some((s.config.tcp_port, s.dpi))
-    })
-    .flatten();
-    let Some((def_port, dpi)) = snapshot else {
-        return;
-    };
-
-    let res = show_add_manual_peer_dialog(hwnd, def_port, dpi);
-    let focus_target = with_ui_and_state_mut(|handles, state| {
-        state.modal_open = false;
-        if let Some((host, tcp_port)) = res
-            && state.app_state == AppStateKind::LoggedIn
-        {
-            if state
-                .cmd_tx
-                .try_send(UiCommand::AddManualPeer {
-                    host: host.clone(),
-                    tcp_port,
-                })
-                .is_err()
+    run_guarded_modal(
+        hwnd,
+        |s| (s.app_state == AppStateKind::LoggedIn).then_some((s.config.tcp_port, s.dpi)),
+        |(def_port, dpi)| show_add_manual_peer_dialog(hwnd, def_port, dpi),
+        |handles, state, res| {
+            if let Some((host, tcp_port)) = res
+                && state.app_state == AppStateKind::LoggedIn
             {
-                set_notice_text(
-                    handles,
-                    state,
-                    "手動ピア追加要求の送信に失敗しました。再度お試しください。",
-                );
-            } else {
-                set_notice_text(
-                    handles,
-                    state,
-                    &format!("{host}:{tcp_port} へ手動ピア接続を試行しています..."),
-                );
+                if state
+                    .cmd_tx
+                    .try_send(UiCommand::AddManualPeer {
+                        host: host.clone(),
+                        tcp_port,
+                    })
+                    .is_err()
+                {
+                    set_notice_text(
+                        handles,
+                        state,
+                        "手動ピア追加要求の送信に失敗しました。再度お試しください。",
+                    );
+                } else {
+                    set_notice_text(
+                        handles,
+                        state,
+                        &format!("{host}:{tcp_port} へ手動ピア接続を試行しています..."),
+                    );
+                }
             }
-        }
-        (state.app_state == AppStateKind::LoggedIn).then_some(handles.main_peer_list)
-    })
-    .flatten();
-    if let Some(target) = focus_target {
-        focus_control(target);
-    }
-    process_pending_file_offers(hwnd);
+            (state.app_state == AppStateKind::LoggedIn).then_some(handles.main_peer_list)
+        },
+        |target_opt| {
+            if let Some(target) = target_opt {
+                focus_control(target);
+            }
+        },
+    );
 }
 
 fn handle_search_modal(hwnd: HWND) {
-    let snapshot = with_state_mut(|s| {
-        if s.modal_open || s.app_state != AppStateKind::LoggedIn {
-            return None;
-        }
-        s.modal_open = true;
-        Some((
-            s.log_reader.clone(),
-            s.active_thread.clone(),
-            s.peers.clone(),
-            s.last_search_query.clone(),
-            s.dpi,
-        ))
-    })
-    .flatten();
-    let Some((log_reader, active_thread, peers, last_query, dpi)) = snapshot else {
-        return;
-    };
-
-    let res = show_search_dialog(hwnd, log_reader, active_thread, &peers, &last_query, dpi);
-    with_state_mut(|state| {
-        state.modal_open = false;
-        if state.app_state == AppStateKind::LoggedIn {
-            state.last_search_query = res.last_query;
-        }
-    });
-    if let Some((thread, index)) = res.jump_target {
-        jump_to_search_hit(thread, index);
-    }
-    process_pending_file_offers(hwnd);
+    run_guarded_modal(
+        hwnd,
+        |s| {
+            (s.app_state == AppStateKind::LoggedIn).then(|| {
+                (
+                    s.log_reader.clone(),
+                    s.active_thread.clone(),
+                    s.peers.clone(),
+                    s.last_search_query.clone(),
+                    s.dpi,
+                )
+            })
+        },
+        |(log_reader, active_thread, peers, last_query, dpi)| {
+            show_search_dialog(hwnd, log_reader, active_thread, &peers, &last_query, dpi)
+        },
+        |_, state, mut res| {
+            if state.app_state == AppStateKind::LoggedIn {
+                state.last_search_query = std::mem::take(&mut res.last_query);
+            }
+            res.jump_target.take()
+        },
+        |jump_opt| {
+            if let Some((thread, index)) = jump_opt {
+                jump_to_search_hit(thread, index);
+            }
+        },
+    );
 }
 
 fn handle_logout_request(hwnd: HWND) {
@@ -1229,51 +1061,36 @@ unsafe extern "system" fn main_wnd_proc(
                         return 0;
                     }
                     IDM_CONN_INFO => {
-                        let info = with_state_mut(|s| {
-                            if s.modal_open || s.app_state != AppStateKind::LoggedIn {
-                                return None;
-                            }
-                            s.modal_open = true;
-                            Some((build_connection_info_text(s), s.dpi))
-                        })
-                        .flatten();
-                        if let Some((text, dpi)) = info {
-                            show_connection_info_dialog(hwnd, &text, dpi);
-                            with_state_mut(|s| s.modal_open = false);
-                            process_pending_file_offers(hwnd);
-                        }
+                        run_guarded_modal(
+                            hwnd,
+                            |s| {
+                                (s.app_state == AppStateKind::LoggedIn)
+                                    .then(|| (build_connection_info_text(s), s.dpi))
+                            },
+                            |(text, dpi)| show_connection_info_dialog(hwnd, &text, dpi),
+                            |_, _, _| {},
+                            |()| {},
+                        );
                         return 0;
                     }
                     IDM_SHORTCUTS => {
-                        let dpi_opt = with_state_mut(|s| {
-                            if s.modal_open {
-                                return None;
-                            }
-                            s.modal_open = true;
-                            Some(s.dpi)
-                        })
-                        .flatten();
-                        if let Some(dpi) = dpi_opt {
-                            show_shortcuts_dialog(hwnd, dpi);
-                            with_state_mut(|s| s.modal_open = false);
-                            process_pending_file_offers(hwnd);
-                        }
+                        run_guarded_modal(
+                            hwnd,
+                            |s| Some(s.dpi),
+                            |dpi| show_shortcuts_dialog(hwnd, dpi),
+                            |_, _, _| {},
+                            |()| {},
+                        );
                         return 0;
                     }
                     IDM_ABOUT => {
-                        let dpi_opt = with_state_mut(|s| {
-                            if s.modal_open {
-                                return None;
-                            }
-                            s.modal_open = true;
-                            Some(s.dpi)
-                        })
-                        .flatten();
-                        if let Some(dpi) = dpi_opt {
-                            show_about_dialog(hwnd, dpi);
-                            with_state_mut(|s| s.modal_open = false);
-                            process_pending_file_offers(hwnd);
-                        }
+                        run_guarded_modal(
+                            hwnd,
+                            |s| Some(s.dpi),
+                            |dpi| show_about_dialog(hwnd, dpi),
+                            |_, _, _| {},
+                            |()| {},
+                        );
                         return 0;
                     }
                     _ => {}
@@ -1331,109 +1148,6 @@ unsafe extern "system" fn main_wnd_proc(
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     })
-}
-
-fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
-    if msg.message != WM_KEYDOWN {
-        return false;
-    }
-    let ctrl = (unsafe { GetKeyState(i32::from(VK_CONTROL)) } as u16 & 0x8000) != 0;
-    let shift = (unsafe { GetKeyState(i32::from(VK_SHIFT)) } as u16 & 0x8000) != 0;
-    let alt = (unsafe { GetKeyState(i32::from(VK_MENU)) } as u16 & 0x8000) != 0;
-    if alt {
-        return false;
-    }
-
-    let snapshot = with_ui_and_state(|handles, state| {
-        (
-            state.app_state,
-            handles.login_name_edit,
-            handles.login_pass_edit,
-            handles.main_chat_list,
-            handles.lock_pass_edit,
-        )
-    });
-    let Some((app_state, name_edit, pass_edit, chat_list, lock_pass_edit)) = snapshot else {
-        return false;
-    };
-
-    if app_state == AppStateKind::LoggedOut
-        && msg.wParam == usize::from(VK_RETURN)
-        && !ctrl
-        && !shift
-    {
-        let focus = unsafe { GetFocus() };
-        if focus == name_edit
-            || focus == pass_edit
-            || msg.hwnd == name_edit
-            || msg.hwnd == pass_edit
-        {
-            submit_login();
-            return true;
-        }
-    }
-
-    if app_state == AppStateKind::Locked {
-        if msg.wParam == usize::from(VK_RETURN) && !ctrl && !shift {
-            let focus = unsafe { GetFocus() };
-            if focus == lock_pass_edit || msg.hwnd == lock_pass_edit {
-                submit_unlock();
-                return true;
-            }
-        }
-        if ctrl && shift && msg.wParam == b'L' as usize {
-            unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_LOGOUT, 0) };
-            return true;
-        }
-        return false;
-    }
-
-    if app_state != AppStateKind::LoggedIn {
-        return false;
-    }
-
-    if ctrl && !shift && msg.wParam == b'L' as usize {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_LOCK_SCREEN, 0) };
-        return true;
-    }
-    if ctrl && !shift && msg.wParam == b'F' as usize {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEARCH, 0) };
-        return true;
-    }
-    if ctrl && shift && msg.wParam == b'F' as usize {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEND_FILE, 0) };
-        return true;
-    }
-
-    if ctrl && shift && msg.wParam == b'L' as usize {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_LOGOUT, 0) };
-        return true;
-    }
-    if ctrl && shift && msg.wParam == usize::from(VK_DELETE) {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_CLEAR_CURRENT, 0) };
-        return true;
-    }
-    if ctrl && !shift && msg.wParam == b'M' as usize {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_ADD_MANUAL_PEER, 0) };
-        return true;
-    }
-    if !ctrl && !shift && msg.wParam == usize::from(VK_F5) {
-        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_REFRESH_NETWORK, 0) };
-        return true;
-    }
-    if !ctrl && msg.wParam == usize::from(VK_F6) {
-        with_ui(|handles| cycle_main_pane_focus(handles, shift));
-        return true;
-    }
-    if !ctrl && !shift && msg.wParam == usize::from(VK_RETURN) {
-        let focus = unsafe { GetFocus() };
-        if focus == chat_list || msg.hwnd == chat_list {
-            unsafe { PostMessageW(hwnd, WM_APP_OPEN_DETAIL, 0, 0) };
-            return true;
-        }
-    }
-
-    false
 }
 
 pub(crate) fn run_app(
@@ -1536,112 +1250,4 @@ pub(crate) fn run_app(
         let _ = runtime.block_on(jh);
     }
     0
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-
-    #[test]
-    fn summarize_message_body_handles_multiline_and_long_text() {
-        assert_eq!(summarize_message_body("こんにちは", 20), "こんにちは");
-        assert_eq!(
-            summarize_message_body("1行目\n2行目", 20),
-            "1行目 / 2行目… [Enterで全文]"
-        );
-        let long = "あ".repeat(80);
-        let summary = summarize_message_body(&long, 70);
-        assert!(summary.ends_with("… [Enterで全文]"));
-        assert_eq!(summary.chars().take(70).count(), 70);
-    }
-
-    #[test]
-    fn normalize_crlf_converts_lf_without_doubling() {
-        assert_eq!(normalize_crlf("a\nb\r\nc"), "a\r\nb\r\nc");
-    }
-
-    #[test]
-    fn format_bytes_human_and_remaining_guide() {
-        assert_eq!(format_bytes_human(512), "512 B");
-        assert_eq!(format_bytes_human(1536), "1.5 KB");
-        assert_eq!(format_bytes_human(2 * 1024 * 1024), "2.00 MB");
-        let label_ctrl = format_remaining_bytes_label(100, false);
-        assert!(label_ctrl.contains("3996 / 4096"));
-        assert!(label_ctrl.contains("送信: Ctrl+Enter"));
-        let label_enter = format_remaining_bytes_label(100, true);
-        assert!(label_enter.contains("送信: Enter / 改行: Shift+Enter"));
-        assert!(format_remaining_bytes_label(4100, false).contains("4 バイト超過"));
-    }
-
-    #[test]
-    fn unix_time_format_outputs_valid_hms_and_datetime() {
-        let hms = format_unix_time_hms(1_700_000_000);
-        assert_eq!(hms.len(), 8);
-        assert_eq!(&hms[2..3], ":");
-        assert_eq!(&hms[5..6], ":");
-        assert_eq!(format_unix_time_hms(-1), "--:--:--");
-
-        let dt = format_unix_datetime(1_700_000_000);
-        assert_eq!(dt.len(), 19);
-    }
-
-    #[test]
-    fn delivery_retryable_and_thread_migration_follow_rules() {
-        assert!(!is_message_retryable(&DeliveryState::Received));
-        assert!(!is_message_retryable(&DeliveryState::DirectDelivered));
-        assert!(is_message_retryable(&DeliveryState::DirectFailed));
-        assert!(is_message_retryable(&DeliveryState::DirectSending));
-
-        let mut acked = HashSet::new();
-        acked.insert("p1".to_string());
-        assert!(!is_message_retryable(&DeliveryState::Broadcast {
-            target_count: 1,
-            acked_peers: acked.clone(),
-            failed_peers: Vec::new(),
-        }));
-        assert!(is_message_retryable(&DeliveryState::Broadcast {
-            target_count: 2,
-            acked_peers: acked,
-            failed_peers: vec!["p2".to_string()],
-        }));
-
-        let formal = PeerView {
-            peer_id: "uuid-bob".to_string(),
-            display_name: "Bob".to_string(),
-            short_id: "uuid-bob".to_string(),
-            ip_text: "127.0.0.1".to_string(),
-            tcp_port: 45102,
-            status: UserStatus::Online,
-            is_online: true,
-            unread_count: 0,
-        };
-        assert_eq!(
-            resolve_migrated_thread(
-                &ThreadKey::Peer("manual:127.0.0.1:45102".to_string()),
-                &[formal]
-            ),
-            ThreadKey::Peer("uuid-bob".to_string())
-        );
-        assert_eq!(
-            resolve_migrated_thread(&ThreadKey::Peer("missing".to_string()), &[]),
-            ThreadKey::Broadcast
-        );
-    }
-
-    #[test]
-    fn normalized_utf8_byte_len_matches_validated_chat_body_len() {
-        for sample in [
-            "こんにちは\r\n2行目\r\t項目\x07\x1b末尾",
-            "絵文字😊と日本語",
-            "line1\nline2",
-        ] {
-            let expected = zerohop::domain::validation::validate_chat_body(sample)
-                .unwrap()
-                .len();
-            assert_eq!(normalized_utf8_byte_len(sample), expected);
-        }
-        assert_eq!(normalized_utf8_byte_len("\x00\x07\r"), 1);
-    }
 }
