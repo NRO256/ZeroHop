@@ -29,6 +29,8 @@ pub struct LocalConfig {
     pub send_on_enter: bool,
     pub hide_notification_preview: bool,
     pub auto_away_minutes: u16,
+    pub uia_announce_incoming: bool,
+    pub auto_logout_on_lock_minutes: u16,
 }
 
 impl Default for LocalConfig {
@@ -45,6 +47,8 @@ impl Default for LocalConfig {
             send_on_enter: false,
             hide_notification_preview: false,
             auto_away_minutes: 5,
+            uia_announce_incoming: true,
+            auto_logout_on_lock_minutes: 30,
         }
     }
 }
@@ -61,6 +65,7 @@ impl LocalConfig {
             .max_memory_mb
             .clamp(MIN_MAX_MEMORY_MB, MAX_MAX_MEMORY_MB);
         self.auto_away_minutes = self.auto_away_minutes.min(60);
+        self.auto_logout_on_lock_minutes = self.auto_logout_on_lock_minutes.min(240);
 
         self.preferred_nic_ip = self
             .preferred_nic_ip
@@ -344,5 +349,28 @@ mod tests {
             std::fs::set_permissions(paths.config_path(), reset).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_b_config_defaults_and_sanitize_clamp_auto_logout_on_lock() {
+        let def = LocalConfig::default();
+        assert!(def.uia_announce_incoming);
+        assert_eq!(def.auto_logout_on_lock_minutes, 30);
+
+        let mut cfg = LocalConfig {
+            uia_announce_incoming: false,
+            auto_logout_on_lock_minutes: 999,
+            ..LocalConfig::default()
+        };
+        cfg.sanitize();
+        assert!(!cfg.uia_announce_incoming);
+        assert_eq!(cfg.auto_logout_on_lock_minutes, 240);
+
+        let mut zero_cfg = LocalConfig {
+            auto_logout_on_lock_minutes: 0,
+            ..LocalConfig::default()
+        };
+        zero_cfg.sanitize();
+        assert_eq!(zero_cfg.auto_logout_on_lock_minutes, 0);
     }
 }

@@ -32,6 +32,8 @@ const IDC_DLG_OPT_SOUND_PEER: usize = 4309;
 const IDC_DLG_OPT_SOUND_MSG: usize = 4310;
 const IDC_DLG_OPT_SEND_ENTER: usize = 4311;
 const IDC_DLG_OPT_HIDE_PREVIEW: usize = 4312;
+const IDC_DLG_OPT_LOCK_LOGOUT: usize = 4313;
+const IDC_DLG_OPT_UIA_ANNOUNCE: usize = 4314;
 
 fn parse_u16_in_range(
     hwnd_field: HWND,
@@ -66,12 +68,14 @@ struct OptionsHandler {
     hwnd_tcp: HWND,
     hwnd_mem: HWND,
     hwnd_away: HWND,
+    hwnd_lock_logout: HWND,
     hwnd_sound_master: HWND,
     hwnd_sound_login: HWND,
     hwnd_sound_peer: HWND,
     hwnd_sound_msg: HWND,
     hwnd_send_enter: HWND,
     hwnd_hide_preview: HWND,
+    hwnd_uia_announce: HWND,
     hwnd_err: HWND,
     result: Option<LocalConfig>,
 }
@@ -107,6 +111,16 @@ impl ModalHandler for OptionsHandler {
             else {
                 return ModalSignal::Continue;
             };
+            let Some(lock_logout_mins) = parse_u16_in_range(
+                self.hwnd_lock_logout,
+                self.hwnd_err,
+                0,
+                240,
+                "ロック中自動ログアウト",
+                " 分",
+            ) else {
+                return ModalSignal::Continue;
+            };
 
             let sel = unsafe { SendMessageW(self.hwnd_nic, CB_GETCURSEL, 0, 0) };
             let preferred_nic_ip = if sel > 0 {
@@ -121,12 +135,14 @@ impl ModalHandler for OptionsHandler {
             next.max_memory_mb = mem_mb;
             next.preferred_nic_ip = preferred_nic_ip;
             next.auto_away_minutes = away_mins;
+            next.auto_logout_on_lock_minutes = lock_logout_mins;
             next.sound_enabled = is_checked(self.hwnd_sound_master);
             next.sound_on_login_logout = is_checked(self.hwnd_sound_login);
             next.sound_on_peer_presence = is_checked(self.hwnd_sound_peer);
             next.sound_on_message = is_checked(self.hwnd_sound_msg);
             next.send_on_enter = is_checked(self.hwnd_send_enter);
             next.hide_notification_preview = is_checked(self.hwnd_hide_preview);
+            next.uia_announce_incoming = is_checked(self.hwnd_uia_announce);
             next.sanitize();
             self.result = Some(next);
             ModalSignal::Close
@@ -158,7 +174,7 @@ pub(crate) fn show_options_dialog(
         parent,
         "オプション設定 - ZeroHop",
         520,
-        520,
+        604,
         dpi,
         |dlg, hinst, ui_font, _| {
             let s = |v| scale_dpi(v, dpi);
@@ -303,6 +319,30 @@ pub(crate) fn show_options_dialog(
                 s(26),
             );
 
+            let _lbl_lock_logout = create_static(
+                dlg,
+                hinst,
+                ui_font,
+                0,
+                "ロック中自動ログアウト (分, 0で無効)(&L):",
+                s(16),
+                s(192),
+                s(280),
+                s(20),
+            );
+            let hwnd_lock_logout = create_edit(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_LOCK_LOGOUT,
+                &cfg_clone.auto_logout_on_lock_minutes.to_string(),
+                (ES_AUTOHSCROLL as u32) | (ES_NUMBER as u32),
+                s(16),
+                s(214),
+                s(120),
+                s(26),
+            );
+
             let hwnd_sound_master = create_checkbox(
                 dlg,
                 hinst,
@@ -311,7 +351,7 @@ pub(crate) fn show_options_dialog(
                 "効果音・通知音を有効にする(&S)",
                 cfg_clone.sound_enabled,
                 s(16),
-                s(194),
+                s(252),
                 s(468),
                 s(22),
             );
@@ -323,7 +363,7 @@ pub(crate) fn show_options_dialog(
                 "ログイン・ログアウト／終了音を鳴らす",
                 cfg_clone.sound_on_login_logout,
                 s(34),
-                s(220),
+                s(278),
                 s(450),
                 s(22),
             );
@@ -335,7 +375,7 @@ pub(crate) fn show_options_dialog(
                 "他ピアの参加・退出音を鳴らす",
                 cfg_clone.sound_on_peer_presence,
                 s(34),
-                s(246),
+                s(304),
                 s(450),
                 s(22),
             );
@@ -347,7 +387,7 @@ pub(crate) fn show_options_dialog(
                 "新着メッセージ通知音を鳴らす",
                 cfg_clone.sound_on_message,
                 s(34),
-                s(272),
+                s(330),
                 s(450),
                 s(22),
             );
@@ -359,7 +399,7 @@ pub(crate) fn show_options_dialog(
                 "Enterキーで送信する (Shift+Enterで改行)(&E)",
                 cfg_clone.send_on_enter,
                 s(16),
-                s(302),
+                s(360),
                 s(468),
                 s(22),
             );
@@ -371,7 +411,19 @@ pub(crate) fn show_options_dialog(
                 "新着通知で送信者・本文プレビューを隠す(&P)",
                 cfg_clone.hide_notification_preview,
                 s(16),
-                s(328),
+                s(386),
+                s(468),
+                s(22),
+            );
+            let hwnd_uia_announce = create_checkbox(
+                dlg,
+                hinst,
+                ui_font,
+                IDC_DLG_OPT_UIA_ANNOUNCE,
+                "新着メッセージをスクリーンリーダーで自動読み上げ(&R)",
+                cfg_clone.uia_announce_incoming,
+                s(16),
+                s(412),
                 s(468),
                 s(22),
             );
@@ -383,7 +435,7 @@ pub(crate) fn show_options_dialog(
                 0,
                 persist_note,
                 s(16),
-                s(362),
+                s(446),
                 s(472),
                 s(34),
             );
@@ -394,7 +446,7 @@ pub(crate) fn show_options_dialog(
                 IDC_DLG_OPT_ERR,
                 "",
                 s(16),
-                s(402),
+                s(486),
                 s(472),
                 s(20),
             );
@@ -407,7 +459,7 @@ pub(crate) fn show_options_dialog(
                 "保存(&O)",
                 true,
                 s(278),
-                s(436),
+                s(520),
                 s(100),
                 s(30),
             );
@@ -419,7 +471,7 @@ pub(crate) fn show_options_dialog(
                 "キャンセル",
                 false,
                 s(388),
-                s(436),
+                s(520),
                 s(100),
                 s(30),
             );
@@ -433,12 +485,14 @@ pub(crate) fn show_options_dialog(
                     hwnd_tcp,
                     hwnd_mem,
                     hwnd_away,
+                    hwnd_lock_logout,
                     hwnd_sound_master,
                     hwnd_sound_login,
                     hwnd_sound_peer,
                     hwnd_sound_msg,
                     hwnd_send_enter,
                     hwnd_hide_preview,
+                    hwnd_uia_announce,
                     hwnd_err,
                     result: None,
                 },

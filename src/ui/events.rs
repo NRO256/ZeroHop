@@ -12,7 +12,8 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GetForegroundWindow,
-    IDI_APPLICATION, IsIconic, LoadIconW, SendMessageW, SetMenu, SetWindowTextW,
+    IDI_APPLICATION, IsIconic, KillTimer, LoadIconW, SendMessageW, SetMenu, SetTimer,
+    SetWindowTextW,
 };
 
 use zerohop::app::state::{AppEvent, AppStateKind};
@@ -35,7 +36,11 @@ use super::state_helpers::{
     ActiveUiTransfer, PendingUiFileOffer, with_state, with_state_mut, with_ui_and_state_mut,
 };
 use super::transfer_ui::{process_pending_file_offers, sync_file_transfer_button};
-use super::{WM_APP_TRAY_CALLBACK, format_bytes_human, to_wide, write_utf16_buf};
+use super::uia_notify::announce_uia_notification;
+use super::{
+    DELIVERY_DEBOUNCE_MS, TIMER_DELIVERY_DEBOUNCE, WM_APP_TRAY_CALLBACK, format_bytes_human,
+    to_wide, write_utf16_buf,
+};
 
 const TRAY_ICON_ID: u32 = 1;
 
@@ -229,12 +234,12 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                 sender_name,
                 preview,
             } => {
-                with_ui_and_state_mut(|handles, state| {
+                let uia_text = with_ui_and_state_mut(|handles, state| {
                     if !matches!(
                         state.app_state,
                         AppStateKind::LoggedIn | AppStateKind::Locked
                     ) {
-                        return;
+                        return None;
                     }
                     let is_locked = state.app_state == AppStateKind::Locked;
                     let fg = !is_locked && is_window_foreground(hwnd);
@@ -268,7 +273,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                                     "新着メッセージがあります".to_string(),
                                 )
                             } else {
-                                (format!("新着メッセージ: {sender_name}"), preview)
+                                (format!("新着メッセージ: {sender_name}"), preview.clone())
                             };
                             show_balloon_notification(
                                 hwnd,
@@ -277,12 +282,29 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                                 &body,
                             );
                         }
+                        if state.config.uia_announce_incoming {
+                            return Some(if state.config.hide_notification_preview {
+                                "新着メッセージがあります".to_string()
+                            } else {
+                                format!("{sender_name}: {preview}")
+                            });
+                        }
                     }
-                });
+                    None
+                })
+                .flatten();
+                if let Some(text) = uia_text {
+                    announce_uia_notification(hwnd, &text);
+                }
             }
             AppEvent::ScreenLocked => {
                 let post = with_ui_and_state_mut(|handles, state| {
                     state.app_state = AppStateKind::Locked;
+                    state.locked_at = Some(Instant::now());
+                    state.auto_logout_sent = false;
+                    let kill_debounce = state.delivery_debounce_timer_active;
+                    state.pending_delivery_sync = false;
+                    state.delivery_debounce_timer_active = false;
                     remove_tray_icon(hwnd, &mut state.tray_icon_added);
                     show_main_controls(handles, false);
                     sync_menu_enabled_state(handles.hmenu_main, AppStateKind::Locked);
@@ -305,9 +327,15 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                             allow_autoscroll: false,
                         },
                         handles.lock_pass_edit,
+                        kill_debounce,
                     )
                 });
-                if let Some((lv, focus_target)) = post {
+                if let Some((lv, focus_target, kill_debounce)) = post {
+                    if kill_debounce {
+                        unsafe {
+                            KillTimer(hwnd, TIMER_DELIVERY_DEBOUNCE);
+                        }
+                    }
                     apply_virtual_listview_sync(lv);
                     focus_control(focus_target);
                 }
@@ -316,6 +344,8 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                 if ok {
                     let post = with_ui_and_state_mut(|handles, state| {
                         state.app_state = AppStateKind::LoggedIn;
+                        state.locked_at = None;
+                        state.auto_logout_sent = false;
                         unsafe {
                             let empty = to_wide("");
                             SetWindowTextW(handles.lock_pass_edit, empty.as_ptr());
@@ -391,22 +421,27 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                 }
             }
             AppEvent::DeliveryUpdated { thread, .. } => {
-                let lv_opt = with_ui_and_state_mut(|handles, state| {
+                let start_timer = with_ui_and_state_mut(|handles, state| {
                     if state.app_state != AppStateKind::LoggedIn {
-                        return None;
+                        return false;
                     }
                     state.total_log_bytes = state.log_reader.total_bytes();
-                    let lv = if state.active_thread == thread {
-                        Some(prepare_virtual_listview_sync(handles, state, false))
-                    } else {
-                        None
-                    };
+                    if state.active_thread == thread {
+                        state.pending_delivery_sync = true;
+                    }
                     update_status_bar(handles, state);
-                    lv
+                    if state.pending_delivery_sync && !state.delivery_debounce_timer_active {
+                        state.delivery_debounce_timer_active = true;
+                        true
+                    } else {
+                        false
+                    }
                 })
-                .flatten();
-                if let Some(lv) = lv_opt {
-                    apply_virtual_listview_sync(lv);
+                .unwrap_or(false);
+                if start_timer {
+                    unsafe {
+                        SetTimer(hwnd, TIMER_DELIVERY_DEBOUNCE, DELIVERY_DEBOUNCE_MS, None);
+                    }
                 }
             }
             AppEvent::NetworkRefreshed {
@@ -479,6 +514,23 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         state,
                         &format!(
                             "【版数不一致】{peer_ip} から非互換プロトコル v{received_version} の通信を受信しました。"
+                        ),
+                    );
+                });
+            }
+            AppEvent::AdvertisedIpMismatch {
+                peer_ip,
+                advertised_ip,
+            } => {
+                with_ui_and_state_mut(|handles, state| {
+                    if state.app_state != AppStateKind::LoggedIn {
+                        return;
+                    }
+                    set_notice_text(
+                        handles,
+                        state,
+                        &format!(
+                            "【IP不一致警告】{peer_ip} からの Hello で異なる通知IP ({advertised_ip}) を検出したため破棄しました。ピアのNIC設定を確認してください。"
                         ),
                     );
                 });
@@ -577,6 +629,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
             AppEvent::LogoutCompleted => {
                 let post = with_ui_and_state_mut(|handles, state| {
                     let was_locked = state.app_state == AppStateKind::Locked;
+                    let kill_debounce = state.delivery_debounce_timer_active;
                     play_sound_if_allowed(
                         &mut state.sound,
                         SoundEvent::Logout,
@@ -601,9 +654,14 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     set_authenticating_ui(handles, false);
                     reset_login_form(handles, false);
                     state.last_focus = handles.login_name_edit;
-                    (clear_args, handles.login_name_edit)
+                    (clear_args, handles.login_name_edit, kill_debounce)
                 });
-                if let Some((clear_args, focus_target)) = post {
+                if let Some((clear_args, focus_target, kill_debounce)) = post {
+                    if kill_debounce {
+                        unsafe {
+                            KillTimer(hwnd, TIMER_DELIVERY_DEBOUNCE);
+                        }
+                    }
                     apply_clear_main_controls(clear_args);
                     focus_control(focus_target);
                 }
@@ -611,14 +669,20 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
             AppEvent::ShutdownReady => {
                 let exit_info = with_ui_and_state_mut(|handles, state| {
                     let was_locked = state.app_state == AppStateKind::Locked;
+                    let kill_debounce = state.delivery_debounce_timer_active;
                     let cfg = state.config.clone();
                     remove_tray_icon(hwnd, &mut state.tray_icon_added);
                     state.app_state = AppStateKind::Exiting;
                     let args = extract_clear_main_args(handles, state);
                     state.clear_session_fields();
-                    (args, cfg, was_locked)
+                    (args, cfg, was_locked, kill_debounce)
                 });
-                if let Some((args, cfg, was_locked)) = exit_info {
+                if let Some((args, cfg, was_locked, kill_debounce)) = exit_info {
+                    if kill_debounce {
+                        unsafe {
+                            KillTimer(hwnd, TIMER_DELIVERY_DEBOUNCE);
+                        }
+                    }
                     apply_clear_main_controls(args);
                     play_logout_on_exit_sync(&cfg, was_locked);
                 }

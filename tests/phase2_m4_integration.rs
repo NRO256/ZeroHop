@@ -215,3 +215,73 @@ async fn screen_lock_retains_inbound_verifies_password_searches_and_allows_direc
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+#[tokio::test]
+async fn advertised_ip_mismatch_hello_emits_notification_event() {
+    let dir = temp_base_dir("adv_ip_mismatch");
+    let (node, rx) = spawn_test_node(&dir);
+    let pass = "phase-b-adv-ip-test";
+
+    node.cmd_tx
+        .send(UiCommand::LoginRequest {
+            display_name: "Alice".to_string(),
+            password: Zeroizing::new(pass.to_string()),
+        })
+        .await
+        .unwrap();
+
+    let tcp_port = match wait_for_event(&rx, Duration::from_secs(5), |ev| {
+        matches!(ev, AppEvent::LoginSucceeded { .. })
+    })
+    .await
+    {
+        AppEvent::LoginSucceeded { tcp_port, .. } => tcp_port,
+        other => unreachable!("{other:?}"),
+    };
+
+    let keys = zerohop::crypto::kdf::derive_session_keys_with_params(
+        pass,
+        zerohop::crypto::kdf::Argon2Params {
+            m_cost_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        },
+    )
+    .unwrap();
+    let msg_key = keys.with_msg_key(|k| Zeroizing::new(*k)).unwrap();
+    let now = zerohop::network::current_unix_timestamp();
+    let bogus_adv: std::net::IpAddr = "10.99.88.77".parse().unwrap();
+    let target: std::net::SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+    let payload = zerohop::domain::protocol::TcpPayload::Hello {
+        sender_id: "manual-peer-id-001".to_string(),
+        sender_name: "RemotePeer".to_string(),
+        tcp_port: 45999,
+        status: zerohop::domain::model::UserStatus::Online,
+        timestamp: now,
+        seq: 1,
+        advertised_ip: Some(bogus_adv),
+    };
+    zerohop::network::tcp_transport::send_tcp_control_frame(target, &msg_key, &payload)
+        .await
+        .unwrap();
+
+    let ev = wait_for_event(&rx, Duration::from_secs(5), |ev| {
+        matches!(ev, AppEvent::AdvertisedIpMismatch { .. })
+    })
+    .await;
+    match ev {
+        AppEvent::AdvertisedIpMismatch {
+            peer_ip,
+            advertised_ip,
+        } => {
+            assert_eq!(peer_ip, "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+            assert_eq!(advertised_ip, bogus_adv);
+        }
+        other => unreachable!("{other:?}"),
+    }
+
+    node.cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+    let _ = node.join_handle.await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

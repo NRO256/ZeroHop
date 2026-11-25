@@ -13,12 +13,14 @@ pub mod sound;
 pub mod state_helpers;
 pub mod theme;
 pub mod transfer_ui;
+pub mod uia_notify;
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::error::TrySendError;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -65,11 +67,12 @@ use login_view::{
     update_password_guide,
 };
 use main_view::{
-    apply_clear_main_controls, clear_unread_for_thread, create_main_controls,
-    extract_clear_main_args, handle_lv_getdispinfo, handle_peer_list_selchange, jump_to_search_hit,
-    layout_main_controls, open_selected_message_detail, refresh_peer_list, remove_main_subclasses,
-    retry_selected_message, send_current_input, set_input_send_on_enter, set_notice_text,
-    show_main_controls, update_input_byte_guide, update_status_bar,
+    apply_clear_main_controls, apply_virtual_listview_sync, clear_unread_for_thread,
+    create_main_controls, extract_clear_main_args, handle_lv_getdispinfo,
+    handle_peer_list_selchange, jump_to_search_hit, layout_main_controls,
+    open_selected_message_detail, prepare_virtual_listview_sync, refresh_peer_list,
+    remove_main_subclasses, retry_selected_message, send_current_input, set_input_send_on_enter,
+    set_notice_text, show_main_controls, update_input_byte_guide, update_status_bar,
 };
 use menu_bar::{
     create_main_menu_bar, sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check,
@@ -97,6 +100,25 @@ pub(crate) const WM_APP_OPEN_DETAIL: u32 = WM_APP + 2;
 pub(crate) const WM_APP_TRAY_CALLBACK: u32 = WM_APP + 3;
 
 pub(crate) const TIMER_AUTO_AWAY: usize = 1;
+pub(crate) const TIMER_DELIVERY_DEBOUNCE: usize = 2;
+pub(crate) const DELIVERY_DEBOUNCE_MS: u32 = 250;
+
+pub(crate) fn should_auto_logout_on_lock(
+    app_state: AppStateKind,
+    locked_at: Option<Instant>,
+    timeout_minutes: u16,
+    auto_logout_sent: bool,
+    now: Instant,
+) -> bool {
+    if app_state != AppStateKind::Locked || auto_logout_sent || timeout_minutes == 0 {
+        return false;
+    }
+    let Some(since) = locked_at else {
+        return false;
+    };
+    let threshold = Duration::from_secs(u64::from(timeout_minutes).saturating_mul(60));
+    now.saturating_duration_since(since) >= threshold
+}
 
 // メニューコマンド ID (Phase 1〜2)
 pub(crate) const IDM_STATUS_ONLINE: usize = 1001;
@@ -724,6 +746,10 @@ unsafe extern "system" fn main_wnd_proc(
                     tray_icon_added: false,
                     active_transfer: None,
                     pending_file_offers: VecDeque::new(),
+                    locked_at: None,
+                    auto_logout_sent: false,
+                    pending_delivery_sync: false,
+                    delivery_debounce_timer_active: false,
                 };
                 if let Ok(mut slot) = init_box.join_slot.lock() {
                     *slot = Some(app_handle.join_handle);
@@ -757,38 +783,74 @@ unsafe extern "system" fn main_wnd_proc(
                         cbSize: size_of::<LASTINPUTINFO>() as u32,
                         dwTime: 0,
                     };
-                    if GetLastInputInfo(&raw mut lii) != 0 {
-                        let idle_ms = GetTickCount().wrapping_sub(lii.dwTime);
-                        with_ui_and_state_mut(|handles, state| {
-                            if state.app_state != AppStateKind::LoggedIn {
-                                return;
+                    let idle_ms = if GetLastInputInfo(&raw mut lii) != 0 {
+                        Some(GetTickCount().wrapping_sub(lii.dwTime))
+                    } else {
+                        None
+                    };
+                    let now = Instant::now();
+                    with_ui_and_state_mut(|handles, state| {
+                        if state.app_state == AppStateKind::Locked {
+                            if should_auto_logout_on_lock(
+                                state.app_state,
+                                state.locked_at,
+                                state.config.auto_logout_on_lock_minutes,
+                                state.auto_logout_sent,
+                                now,
+                            ) {
+                                state.auto_logout_sent = true;
+                                let _ = state.cmd_tx.try_send(UiCommand::Logout);
                             }
-                            let mins = state.config.auto_away_minutes;
-                            if mins == 0 {
-                                return;
-                            }
-                            let threshold_ms = u32::from(mins).saturating_mul(60_000);
-                            if idle_ms >= threshold_ms && state.status == UserStatus::Online {
-                                state.auto_away_triggered = true;
-                                state.status = UserStatus::Away;
-                                sync_status_menu_check(handles.hmenu_status, UserStatus::Away);
-                                update_status_bar(handles, state);
-                                let _ = state
-                                    .cmd_tx
-                                    .try_send(UiCommand::ChangeStatus(UserStatus::Away));
-                            } else if idle_ms < 15_000
-                                && state.auto_away_triggered
-                                && state.status == UserStatus::Away
-                            {
-                                state.auto_away_triggered = false;
-                                state.status = UserStatus::Online;
-                                sync_status_menu_check(handles.hmenu_status, UserStatus::Online);
-                                update_status_bar(handles, state);
-                                let _ = state
-                                    .cmd_tx
-                                    .try_send(UiCommand::ChangeStatus(UserStatus::Online));
-                            }
-                        });
+                            return;
+                        }
+                        if state.app_state != AppStateKind::LoggedIn {
+                            return;
+                        }
+                        let Some(idle_ms) = idle_ms else {
+                            return;
+                        };
+                        let mins = state.config.auto_away_minutes;
+                        if mins == 0 {
+                            return;
+                        }
+                        let threshold_ms = u32::from(mins).saturating_mul(60_000);
+                        if idle_ms >= threshold_ms && state.status == UserStatus::Online {
+                            state.auto_away_triggered = true;
+                            state.status = UserStatus::Away;
+                            sync_status_menu_check(handles.hmenu_status, UserStatus::Away);
+                            update_status_bar(handles, state);
+                            let _ = state
+                                .cmd_tx
+                                .try_send(UiCommand::ChangeStatus(UserStatus::Away));
+                        } else if idle_ms < 15_000
+                            && state.auto_away_triggered
+                            && state.status == UserStatus::Away
+                        {
+                            state.auto_away_triggered = false;
+                            state.status = UserStatus::Online;
+                            sync_status_menu_check(handles.hmenu_status, UserStatus::Online);
+                            update_status_bar(handles, state);
+                            let _ = state
+                                .cmd_tx
+                                .try_send(UiCommand::ChangeStatus(UserStatus::Online));
+                        }
+                    });
+                } else if wparam == TIMER_DELIVERY_DEBOUNCE {
+                    KillTimer(hwnd, TIMER_DELIVERY_DEBOUNCE);
+                    let lv_opt = with_ui_and_state_mut(|handles, state| {
+                        state.delivery_debounce_timer_active = false;
+                        if state.app_state == AppStateKind::LoggedIn && state.pending_delivery_sync
+                        {
+                            state.pending_delivery_sync = false;
+                            Some(prepare_virtual_listview_sync(handles, state, false))
+                        } else {
+                            state.pending_delivery_sync = false;
+                            None
+                        }
+                    })
+                    .flatten();
+                    if let Some(lv) = lv_opt {
+                        apply_virtual_listview_sync(lv);
                     }
                 }
                 0
@@ -1131,6 +1193,7 @@ unsafe extern "system" fn main_wnd_proc(
             }
             WM_DESTROY => {
                 KillTimer(hwnd, TIMER_AUTO_AWAY);
+                KillTimer(hwnd, TIMER_DELIVERY_DEBOUNCE);
                 with_ui_and_state_mut(|handles, state| {
                     state.window_alive.store(false, Ordering::SeqCst);
                     remove_tray_icon(hwnd, &mut state.tray_icon_added);
@@ -1250,4 +1313,49 @@ pub(crate) fn run_app(
         let _ = runtime.block_on(jh);
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_auto_logout_on_lock_checks_state_timeout_and_once_guard() {
+        let base = Instant::now();
+        assert!(!should_auto_logout_on_lock(
+            AppStateKind::LoggedIn,
+            Some(base),
+            30,
+            false,
+            base + Duration::from_secs(3600),
+        ));
+        assert!(!should_auto_logout_on_lock(
+            AppStateKind::Locked,
+            Some(base),
+            0,
+            false,
+            base + Duration::from_secs(3600),
+        ));
+        assert!(!should_auto_logout_on_lock(
+            AppStateKind::Locked,
+            Some(base),
+            30,
+            false,
+            base + Duration::from_secs(29 * 60 + 59),
+        ));
+        assert!(should_auto_logout_on_lock(
+            AppStateKind::Locked,
+            Some(base),
+            30,
+            false,
+            base + Duration::from_secs(30 * 60),
+        ));
+        assert!(!should_auto_logout_on_lock(
+            AppStateKind::Locked,
+            Some(base),
+            30,
+            true,
+            base + Duration::from_secs(30 * 60),
+        ));
+    }
 }

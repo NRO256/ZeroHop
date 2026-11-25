@@ -230,6 +230,10 @@ pub enum AppEvent {
         peer_ip: std::net::IpAddr,
         received_version: u16,
     },
+    AdvertisedIpMismatch {
+        peer_ip: std::net::IpAddr,
+        advertised_ip: std::net::IpAddr,
+    },
     LogoutCompleted,
     ShutdownReady,
     ErrorNotice(String),

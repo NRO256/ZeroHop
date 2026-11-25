@@ -6,6 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::HWND;
@@ -187,6 +188,10 @@ pub(crate) struct UiState {
     pub tray_icon_added: bool,
     pub active_transfer: Option<ActiveUiTransfer>,
     pub pending_file_offers: VecDeque<PendingUiFileOffer>,
+    pub locked_at: Option<Instant>,
+    pub auto_logout_sent: bool,
+    pub pending_delivery_sync: bool,
+    pub delivery_debounce_timer_active: bool,
 }
 
 impl UiState {
@@ -217,6 +222,10 @@ impl UiState {
         self.auto_away_triggered = false;
         self.active_transfer = None;
         self.pending_file_offers.clear();
+        self.locked_at = None;
+        self.auto_logout_sent = false;
+        self.pending_delivery_sync = false;
+        self.delivery_debounce_timer_active = false;
     }
 }
 

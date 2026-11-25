@@ -297,6 +297,12 @@ impl Coordinator {
             && !adv.is_unspecified()
             && normalize_ip(adv) != normalize_ip(peer_ip)
         {
+            if self.allow_anomaly_now(peer_ip) {
+                self.emit(AppEvent::AdvertisedIpMismatch {
+                    peer_ip,
+                    advertised_ip: adv,
+                });
+            }
             return;
         }
         if let Err(skew_seconds) =

@@ -1,7 +1,9 @@
 //! UI 表示用純粋フォーマット・時刻変換・通信情報生成・スレッド移行ヘルパー。
 
 use std::mem::{size_of, zeroed};
+use std::net::{SocketAddr, TcpStream};
 use std::ptr::null;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -9,6 +11,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 use zerohop::domain::model::{DeliveryState, MAX_CHAT_BODY_BYTES, PeerView, ThreadKey};
+use zerohop::network::nic::NicInfo;
 
 use super::state_helpers::UiState;
 
@@ -171,6 +174,29 @@ pub(crate) fn get_process_working_set_bytes() -> Option<usize> {
     (ok != 0).then_some(pmc.WorkingSetSize)
 }
 
+pub(crate) fn run_loopback_connectivity_diagnostic(
+    tcp_port: u16,
+    nic_info: Option<&NicInfo>,
+) -> String {
+    let tcp_diag = if tcp_port == 0 {
+        "未待受 (TCPポート=0)".to_string()
+    } else {
+        let addr = SocketAddr::from(([127, 0, 0, 1], tcp_port));
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            Ok(_) => format!("ループバックTCP待受応答: OK (127.0.0.1:{tcp_port})"),
+            Err(err) => format!(
+                "ループバックTCP待受応答: NG (127.0.0.1:{tcp_port} - {:?})",
+                err.kind()
+            ),
+        }
+    };
+    let udp_diag = match nic_info {
+        Some(n) => format!("UDPブロードキャスト対象: {} -> {}", n.ip, n.broadcast),
+        None => "UDPブロードキャスト対象: 既定バインド (NIC未指定)".to_string(),
+    };
+    format!("{tcp_diag}\n  {udp_diag}")
+}
+
 pub(crate) fn build_connection_info_text(state: &UiState) -> String {
     let ws = get_process_working_set_bytes()
         .map(format_bytes_human)
@@ -205,6 +231,12 @@ pub(crate) fn build_connection_info_text(state: &UiState) -> String {
             state.config.max_memory_mb
         ),
         format!("プロセス Working Set: {ws}"),
+        String::new(),
+        "[簡易疎通診断]".to_string(),
+        format!(
+            "  {}",
+            run_loopback_connectivity_diagnostic(state.tcp_port, state.nic_info.as_ref())
+        ),
         String::new(),
         format!("検出・追加済みピア ({}件):", state.peers.len()),
     ];
@@ -336,5 +368,18 @@ mod tests {
             assert_eq!(normalized_utf8_byte_len(sample), expected);
         }
         assert_eq!(normalized_utf8_byte_len("\x00\x07\r"), 1);
+    }
+
+    #[test]
+    fn loopback_connectivity_diagnostic_reports_ok_for_bound_listener_and_zero_port() {
+        let zero = run_loopback_connectivity_diagnostic(0, None);
+        assert!(zero.contains("未待受"));
+        assert!(zero.contains("既定バインド"));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ok = run_loopback_connectivity_diagnostic(port, None);
+        assert!(ok.contains("ループバックTCP待受応答: OK"));
+        drop(listener);
     }
 }
