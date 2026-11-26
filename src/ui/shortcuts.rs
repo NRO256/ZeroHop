@@ -13,8 +13,9 @@ use super::lock_view::submit_unlock;
 use super::login_view::submit_login;
 use super::state_helpers::{with_ui, with_ui_and_state};
 use super::{
-    IDM_ADD_MANUAL_PEER, IDM_CLEAR_CURRENT, IDM_LOCK_SCREEN, IDM_LOGOUT, IDM_REFRESH_NETWORK,
-    IDM_SEARCH, IDM_SEND_FILE, WM_APP_OPEN_DETAIL,
+    IDM_ADD_MANUAL_PEER, IDM_CLEAR_CURRENT, IDM_EXPORT_CHAT_LOG, IDM_INSERT_MENTION,
+    IDM_LOCK_SCREEN, IDM_LOGOUT, IDM_REFRESH_NETWORK, IDM_SEARCH, IDM_SEND_FILE,
+    WM_APP_OPEN_DETAIL,
 };
 
 pub(crate) fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
@@ -84,6 +85,10 @@ pub(crate) fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
         unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEARCH, 0) };
         return true;
     }
+    if ctrl && !shift && msg.wParam == b'S' as usize {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_EXPORT_CHAT_LOG, 0) };
+        return true;
+    }
     if ctrl && shift && msg.wParam == b'F' as usize {
         unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_SEND_FILE, 0) };
         return true;
@@ -99,6 +104,10 @@ pub(crate) fn handle_global_shortcut(hwnd: HWND, msg: &MSG) -> bool {
     }
     if ctrl && !shift && msg.wParam == b'M' as usize {
         unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_ADD_MANUAL_PEER, 0) };
+        return true;
+    }
+    if ctrl && shift && msg.wParam == b'M' as usize {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, IDM_INSERT_MENTION, 0) };
         return true;
     }
     if !ctrl && !shift && msg.wParam == usize::from(VK_F5) {

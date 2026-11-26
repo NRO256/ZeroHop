@@ -158,6 +158,78 @@ pub fn validate_received_chat_body(body: &str) -> Result<String, ValidationError
     validate_chat_body(body)
 }
 
+pub const MAX_REPLY_PREVIEW_CHARS: usize = 60;
+
+pub fn sanitize_reply_preview(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter_map(|ch| {
+            if ch == '\r' || ch == '\n' || ch == '\t' {
+                Some(' ')
+            } else if ch.is_control() {
+                None
+            } else {
+                Some(ch)
+            }
+        })
+        .collect();
+    cleaned
+        .trim()
+        .chars()
+        .take(MAX_REPLY_PREVIEW_CHARS)
+        .collect()
+}
+
+pub fn sanitize_reply_reference(
+    reply_to_id: Option<&str>,
+    reply_to_sender: Option<&str>,
+    reply_to_preview: Option<&str>,
+) -> Option<crate::domain::model::ReplyReference> {
+    let message_id = reply_to_id?.trim();
+    if validate_identifier(message_id).is_err() {
+        return None;
+    }
+    let sender_name = validate_and_normalize_display_name(reply_to_sender?).ok()?;
+    let preview = sanitize_reply_preview(reply_to_preview.unwrap_or(""));
+    Some(crate::domain::model::ReplyReference {
+        message_id: message_id.to_string(),
+        sender_name,
+        preview,
+    })
+}
+
+fn is_mention_boundary_char(ch: char) -> bool {
+    !ch.is_alphanumeric() && ch != '_'
+}
+
+pub fn contains_mention(body: &str, display_name: &str) -> bool {
+    let target = display_name.trim();
+    if target.is_empty() || body.is_empty() {
+        return false;
+    }
+
+    let mut prev_char: Option<char> = None;
+    for (idx, ch) in body.char_indices() {
+        if ch == '@' {
+            let valid_before = prev_char.is_none_or(is_mention_boundary_char);
+            if valid_before {
+                let after_at = &body[idx + 1..];
+                if after_at.is_char_boundary(target.len()) {
+                    let candidate = &after_at[..target.len()];
+                    if candidate.eq_ignore_ascii_case(target) {
+                        let next_char = after_at[target.len()..].chars().next();
+                        if next_char.is_none_or(is_mention_boundary_char) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        prev_char = Some(ch);
+    }
+    false
+}
+
 pub fn validate_port(port: u16) -> Result<u16, ValidationError> {
     if port == 0 {
         return Err(ValidationError::InvalidPort);
@@ -459,5 +531,40 @@ mod tests {
         assert!(!sanitized.contains('\0'));
         assert!(!sanitized.contains('\x1b'));
         assert!(!sanitized.contains('\r'));
+    }
+
+    #[test]
+    fn sanitize_reply_reference_strips_controls_and_truncates_to_60_chars() {
+        assert!(sanitize_reply_reference(None, Some("Alice"), Some("hi")).is_none());
+        assert!(sanitize_reply_reference(Some("bad id"), Some("Alice"), Some("hi")).is_none());
+        assert!(sanitize_reply_reference(Some("m1"), Some(""), Some("hi")).is_none());
+
+        let long_raw = format!("あ\r\nい\x07\x1bう{}", "え".repeat(80));
+        let r = sanitize_reply_reference(Some("m1"), Some(" Alice "), Some(&long_raw)).unwrap();
+        assert_eq!(r.message_id, "m1");
+        assert_eq!(r.sender_name, "Alice");
+        assert!(!r.preview.contains('\r'));
+        assert!(!r.preview.contains('\n'));
+        assert!(!r.preview.contains('\x07'));
+        assert!(!r.preview.contains('\x1b'));
+        assert_eq!(r.preview.chars().count(), MAX_REPLY_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn contains_mention_handles_boundaries_japanese_multiple_and_empty() {
+        assert!(contains_mention("@Alice お願いします", "Alice"));
+        assert!(contains_mention("こんにちは @alice!", "Alice"));
+        assert!(contains_mention("連絡(@Alice)です", "Alice"));
+        assert!(contains_mention("@Bob @Alice\n確認してください", "Alice"));
+        assert!(contains_mention("@山田太郎、明日の件です", "山田太郎"));
+
+        // 部分一致・メール風・空表示名は除外
+        assert!(!contains_mention("@Alice2 お願いします", "Alice"));
+        assert!(!contains_mention("@Alice_san こんにちは", "Alice"));
+        assert!(!contains_mention("mail@Alice.example", "Alice"));
+        assert!(!contains_mention("foo@Alice", "Alice"));
+        assert!(!contains_mention("@Alice", ""));
+        assert!(!contains_mention("@Alice", "   "));
+        assert!(!contains_mention("", "Alice"));
     }
 }

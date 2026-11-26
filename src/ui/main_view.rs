@@ -3,56 +3,66 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{HFONT, InvalidateRect};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, HFONT, InvalidateRect};
 use windows_sys::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
-    EM_SETLIMITTEXT, EM_SETSEL, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT,
-    LVCOLUMNW, LVIF_TEXT, LVM_ENSUREVISIBLE, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
-    LVSICF_NOSCROLL, NMLVDISPINFOW, SB_SETPARTS, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
+    EM_REPLACESEL, EM_SETLIMITTEXT, EM_SETSEL, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
+    LVCFMT_LEFT, LVCOLUMNW, LVIF_TEXT, LVIR_BOUNDS, LVM_ENSUREVISIBLE, LVM_GETITEMRECT,
+    LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSICF_NOSCROLL, NMLVDISPINFOW, SB_SETPARTS, SB_SETTEXTW,
+    STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
+    GetKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CreateWindowExW, DLGC_WANTMESSAGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_READONLY, ES_WANTRETURN, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
-    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MSG, MoveWindow, PostMessageW, SW_HIDE, SW_SHOW,
-    SendMessageW, SetWindowTextW, ShowWindow, WM_CHAR, WM_GETDLGCODE, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_SETFONT, WS_BORDER, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    AppendMenuW, BS_PUSHBUTTON, CreatePopupMenu, CreateWindowExW, DLGC_WANTMESSAGE, DestroyMenu,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, ES_WANTRETURN, GWL_STYLE,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, LB_ADDSTRING, LB_GETCURSEL,
+    LB_RESETCONTENT, LB_SETCURSEL, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, MoveWindow, PostMessageW, SW_HIDE, SW_SHOW, SendMessageW, SetWindowTextW,
+    ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu, WM_CHAR, WM_COMMAND,
+    WM_GETDLGCODE, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_SETFONT, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use zerohop::app::coordinator::TryReadMessage;
 use zerohop::app::state::{AppStateKind, UiCommand};
-use zerohop::domain::model::{MAX_MESSAGES_PER_THREAD, ThreadKey};
-use zerohop::domain::validation::validate_chat_body;
+use zerohop::domain::model::{DeliveryState, ReplyReference, ThreadKey};
+use zerohop::domain::validation::{contains_mention, sanitize_reply_preview, validate_chat_body};
 
 use super::a11y::{
     focus_control, focus_listview_item, get_selected_listview_index, set_cue_banner,
 };
-use super::dialogs::{DetailDialogAction, DetailDialogInput, show_message_detail_dialog};
-use super::state_helpers::{UiHandles, UiState, with_ui, with_ui_and_state_mut};
+use super::dialogs::{
+    DetailDialogAction, DetailDialogInput, confirm_delete_message, copy_text_to_clipboard,
+    pick_save_text_log_dialog, show_message_detail_dialog,
+};
+use super::state_helpers::{
+    UiHandles, UiState, with_state_mut, with_ui, with_ui_and_state, with_ui_and_state_mut,
+};
 use super::theme::{apply_listview_explorer_theme, scale_dpi};
 use super::transfer_ui::{process_pending_file_offers, sync_file_transfer_button};
 use super::{
-    IDC_MAIN_BYTE_GUIDE, IDC_MAIN_CHAT_LIST, IDC_MAIN_FILE_BTN, IDC_MAIN_INPUT_EDIT,
-    IDC_MAIN_NOTICE, IDC_MAIN_PEER_LABEL, IDC_MAIN_PEER_LIST, IDC_MAIN_SEND_BTN,
-    IDC_MAIN_STATUSBAR, IDC_MAIN_THREAD_HEADER, WM_APP_OPEN_DETAIL, format_bytes_human,
-    format_remaining_bytes_label, format_unix_datetime, format_unix_time_hms, is_message_retryable,
-    make_child_control, normalized_utf8_byte_len, read_window_text_zeroizing,
+    IDC_MAIN_CHAT_LIST, IDC_MAIN_FILE_BTN, IDC_MAIN_INPUT_EDIT, IDC_MAIN_NOTICE,
+    IDC_MAIN_PEER_LABEL, IDC_MAIN_PEER_LIST, IDC_MAIN_REPLY_CLEAR_BTN, IDC_MAIN_REPLY_LABEL,
+    IDC_MAIN_SEND_BTN, IDC_MAIN_STATUSBAR, IDC_MAIN_THREAD_HEADER, WM_APP_OPEN_DETAIL,
+    default_chat_log_filename, format_chat_log_export_text, format_unix_datetime,
+    format_unix_time_hms, is_message_retryable, make_child_control, read_window_text_zeroizing,
     resolve_migrated_thread, summarize_message_body, to_wide, write_utf16_buf,
 };
 
 const SUBCLASS_ID_CHAT_LIST: usize = 201;
 const SUBCLASS_ID_INPUT_EDIT: usize = 202;
 
-static INPUT_SEND_ON_ENTER: AtomicBool = AtomicBool::new(false);
+static INPUT_SEND_ON_ENTER: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn set_input_send_on_enter(hwnd_input: HWND, enabled: bool) {
     INPUT_SEND_ON_ENTER.store(enabled, Ordering::Relaxed);
@@ -72,7 +82,8 @@ pub(crate) struct MainControlHandles {
     pub thread_header: HWND,
     pub notice: HWND,
     pub chat_list: HWND,
-    pub byte_guide: HWND,
+    pub reply_label: HWND,
+    pub reply_clear_btn: HWND,
     pub input_edit: HWND,
     pub send_btn: HWND,
     pub file_btn: HWND,
@@ -196,6 +207,13 @@ unsafe extern "system" fn input_edit_subclass_proc(
                         return 0;
                     }
                 }
+                if wparam == usize::from(VK_ESCAPE) && !ctrl_down && !shift_down && !alt_down {
+                    let parent = ref_data as HWND;
+                    if !parent.is_null() {
+                        PostMessageW(parent, WM_COMMAND, IDC_MAIN_REPLY_CLEAR_BTN, hwnd as LPARAM);
+                    }
+                    return 0;
+                }
                 if ctrl_down && wparam == b'A' as usize {
                     SendMessageW(hwnd, EM_SETSEL, 0, -1);
                     return 0;
@@ -313,8 +331,8 @@ pub(crate) fn create_main_controls(
         );
         apply_listview_explorer_theme(hwnd, high_contrast);
         insert_column(hwnd, 0, "送信者", 110);
-        insert_column(hwnd, 1, "時刻", 76);
-        insert_column(hwnd, 2, "メッセージ（Enterで全文）", 340);
+        insert_column(hwnd, 1, "メッセージ（Enterで全文）", 340);
+        insert_column(hwnd, 2, "時刻", 76);
         insert_column(hwnd, 3, "状態", 110);
         let _ = SetWindowSubclass(
             hwnd,
@@ -324,15 +342,24 @@ pub(crate) fn create_main_controls(
         );
         hwnd
     };
-    let initial_byte_guide = format_remaining_bytes_label(0, false);
-    let byte_guide = make_child_control(
+    let reply_label = make_child_control(
         hwnd_parent,
         hinst,
         static_w.as_ptr(),
-        &initial_byte_guide,
+        "",
         0,
         static_style,
-        IDC_MAIN_BYTE_GUIDE,
+        IDC_MAIN_REPLY_LABEL,
+        ui_font,
+    );
+    let reply_clear_btn = make_child_control(
+        hwnd_parent,
+        hinst,
+        button_w.as_ptr(),
+        "解除",
+        0,
+        WS_CHILD | WS_TABSTOP | (BS_PUSHBUTTON as u32),
+        IDC_MAIN_REPLY_CLEAR_BTN,
         ui_font,
     );
     let input_edit = make_child_control(
@@ -360,7 +387,10 @@ pub(crate) fn create_main_controls(
             hwnd_parent as usize,
         );
     }
-    set_cue_banner(input_edit, "メッセージを入力（Ctrl+Enter で送信）");
+    set_cue_banner(
+        input_edit,
+        "メッセージを入力 (Enter で送信 / Shift+Enter で改行)",
+    );
 
     let send_btn = make_child_control(
         hwnd_parent,
@@ -399,7 +429,8 @@ pub(crate) fn create_main_controls(
         thread_header,
         notice,
         chat_list,
-        byte_guide,
+        reply_label,
+        reply_clear_btn,
         input_edit,
         send_btn,
         file_btn,
@@ -477,15 +508,37 @@ pub(crate) fn layout_main_controls(handles: &UiHandles, client_w: i32, client_h:
         y += notice_h + s(6);
 
         let input_h = s(76);
-        let guide_h = s(20);
         let btn_w = s(96);
-        let list_h = (client_h - sb_h - pad - y - guide_h - input_h - s(10)).max(s(100));
+        let show_reply =
+            (GetWindowLongPtrW(handles.main_reply_clear_btn, GWL_STYLE) as u32 & WS_VISIBLE) != 0;
+        let reply_h = s(24);
+        let reply_total = if show_reply { reply_h + s(4) } else { 0 };
+        let list_h = (client_h - sb_h - pad - y - reply_total - input_h - s(6)).max(s(100));
 
         MoveWindow(handles.main_chat_list, right_x, y, right_w, list_h, 1);
         y += list_h + s(6);
 
-        MoveWindow(handles.main_byte_guide, right_x, y, right_w, guide_h, 1);
-        y += guide_h + s(4);
+        if show_reply {
+            let clear_w = s(64);
+            let label_w = (right_w - clear_w - s(6)).max(s(80));
+            MoveWindow(
+                handles.main_reply_label,
+                right_x,
+                y + s(3),
+                label_w,
+                reply_h - s(3),
+                1,
+            );
+            MoveWindow(
+                handles.main_reply_clear_btn,
+                right_x + label_w + s(6),
+                y,
+                clear_w,
+                reply_h,
+                1,
+            );
+            y += reply_h + s(4);
+        }
 
         let edit_w = (right_w - btn_w - s(8)).max(s(120));
         let send_h = s(44);
@@ -509,11 +562,11 @@ pub(crate) fn layout_main_controls(handles: &UiHandles, client_w: i32, client_h:
             1,
         );
 
-        // 仮想 ListView 列幅の自動配分
+        // 仮想 ListView 列幅の自動配分（送信者 / メッセージ / 時刻 / 状態）
         let col0 = s(108);
-        let col1 = s(76);
+        let col2 = s(76);
         let col3 = s(112);
-        let col2 = (right_w - col0 - col1 - col3 - s(24)).max(s(140));
+        let col1 = (right_w - col0 - col2 - col3 - s(24)).max(s(140));
         SendMessageW(handles.main_chat_list, LVM_SETCOLUMNWIDTH, 0, col0 as isize);
         SendMessageW(handles.main_chat_list, LVM_SETCOLUMNWIDTH, 1, col1 as isize);
         SendMessageW(handles.main_chat_list, LVM_SETCOLUMNWIDTH, 2, col2 as isize);
@@ -527,6 +580,48 @@ pub(crate) fn show_main_controls(handles: &UiHandles, visible: bool) {
         for hwnd in handles.main_controls() {
             ShowWindow(hwnd, cmd);
         }
+        if !visible {
+            ShowWindow(handles.main_reply_label, SW_HIDE);
+            ShowWindow(handles.main_reply_clear_btn, SW_HIDE);
+        }
+    }
+}
+
+pub(crate) fn sync_reply_bar(hwnd_parent: HWND, handles: &UiHandles, state: &UiState) {
+    unsafe {
+        if state.app_state == AppStateKind::LoggedIn
+            && let Some(reply) = &state.pending_reply
+        {
+            let text = format!("返信先: {}「{}」", reply.sender_name, reply.preview);
+            let w = to_wide(&text);
+            SetWindowTextW(handles.main_reply_label, w.as_ptr());
+            ShowWindow(handles.main_reply_label, SW_SHOW);
+            ShowWindow(handles.main_reply_clear_btn, SW_SHOW);
+        } else {
+            ShowWindow(handles.main_reply_label, SW_HIDE);
+            ShowWindow(handles.main_reply_clear_btn, SW_HIDE);
+        }
+        if !hwnd_parent.is_null() {
+            let mut rc: RECT = std::mem::zeroed();
+            if GetClientRect(hwnd_parent, &raw mut rc) != 0 {
+                layout_main_controls(handles, rc.right, rc.bottom, state.dpi);
+            }
+        }
+    }
+}
+
+pub(crate) fn clear_pending_reply_and_relayout(hwnd_parent: HWND) {
+    let target = with_ui_and_state_mut(|handles, state| {
+        if state.pending_reply.take().is_some() {
+            sync_reply_bar(hwnd_parent, handles, state);
+            Some(handles.main_input_edit)
+        } else {
+            None
+        }
+    })
+    .flatten();
+    if let Some(hwnd_input) = target {
+        focus_control(hwnd_input);
     }
 }
 
@@ -536,16 +631,6 @@ pub(crate) fn set_notice_text(handles: &UiHandles, state: &mut UiState, text: &s
     unsafe {
         SetWindowTextW(handles.main_notice, w.as_ptr());
         let _ = InvalidateRect(handles.main_notice, null(), 1);
-    }
-}
-
-pub(crate) fn update_input_byte_guide(handles: &UiHandles, send_on_enter: bool) {
-    let text = read_window_text_zeroizing(handles.main_input_edit);
-    let utf8_bytes = normalized_utf8_byte_len(&text);
-    let label = format_remaining_bytes_label(utf8_bytes, send_on_enter);
-    let w = to_wide(&label);
-    unsafe {
-        SetWindowTextW(handles.main_byte_guide, w.as_ptr());
     }
 }
 
@@ -590,9 +675,8 @@ pub(crate) fn update_status_bar(handles: &UiHandles, state: &UiState) {
     };
     let online_peers = state.peers.iter().filter(|p| p.is_online).count();
     let part2 = format!(
-        "オンライン: {}人 / ログ: {}",
+        "オンライン: {}人",
         online_peers + usize::from(state.app_state == AppStateKind::LoggedIn),
-        format_bytes_human(state.total_log_bytes)
     );
     let part3 = match &state.nic_info {
         Some(nic) => format!("{} ({}:{})", nic.friendly_name, nic.ip, state.tcp_port),
@@ -709,6 +793,19 @@ pub(crate) fn prepare_virtual_listview_sync(
     }
 }
 
+pub(crate) fn should_autoscroll_to_tail(
+    prev_count: usize,
+    new_count: usize,
+    prev_sel: Option<usize>,
+    allow_autoscroll: bool,
+) -> bool {
+    if !allow_autoscroll || new_count == 0 {
+        return false;
+    }
+    let at_tail = prev_count > 0 && prev_sel == Some(prev_count - 1);
+    prev_sel.is_none() || at_tail || prev_sel >= Some(new_count)
+}
+
 /// RefCell 借用解放後に呼び出し、同期 LVN_GETDISPINFOW 再入によるスキップを防止する。
 pub(crate) fn apply_virtual_listview_sync(args: LvSyncArgs) {
     if args.hwnd_lv.is_null() {
@@ -729,11 +826,12 @@ pub(crate) fn apply_virtual_listview_sync(args: LvSyncArgs) {
                 0,
                 (args.new_count - 1) as isize,
             );
-            let at_tail = args.prev_count > 0 && prev_sel == Some(args.prev_count - 1);
-            let appended = args.new_count > args.prev_count
-                || (args.new_count >= MAX_MESSAGES_PER_THREAD
-                    && args.prev_count >= MAX_MESSAGES_PER_THREAD);
-            if args.allow_autoscroll && appended && (prev_sel.is_none() || at_tail) {
+            if should_autoscroll_to_tail(
+                args.prev_count,
+                args.new_count,
+                prev_sel,
+                args.allow_autoscroll,
+            ) {
                 SendMessageW(args.hwnd_lv, LVM_ENSUREVISIBLE, args.new_count - 1, 0);
             }
         }
@@ -745,7 +843,8 @@ pub(crate) struct ClearMainControlsArgs {
     pub thread_header: HWND,
     pub notice: HWND,
     pub chat_list: HWND,
-    pub byte_guide: HWND,
+    pub reply_label: HWND,
+    pub reply_clear_btn: HWND,
     pub input_edit: HWND,
     pub statusbar: HWND,
 }
@@ -761,7 +860,8 @@ pub(crate) fn extract_clear_main_args(
         thread_header: handles.main_thread_header,
         notice: handles.main_notice,
         chat_list: handles.main_chat_list,
-        byte_guide: handles.main_byte_guide,
+        reply_label: handles.main_reply_label,
+        reply_clear_btn: handles.main_reply_clear_btn,
         input_edit: handles.main_input_edit,
         statusbar: handles.main_statusbar,
     }
@@ -771,20 +871,16 @@ pub(crate) fn extract_clear_main_args(
 pub(crate) fn apply_clear_main_controls(args: ClearMainControlsArgs) {
     let empty = to_wide("");
     let default_header = to_wide("全体チャット（全員）");
-    let default_guide = to_wide(&format_remaining_bytes_label(0, false));
-    let sb_parts = [
-        "未ログイン",
-        "CODE: ------",
-        "オンライン: 0人 / ログ: 0 B",
-        "NIC未接続",
-    ];
+    let sb_parts = ["未ログイン", "CODE: ------", "オンライン: 0人", "NIC未接続"];
     unsafe {
         SendMessageW(args.chat_list, LVM_SETITEMCOUNT, 0, 0);
         SendMessageW(args.peer_list, LB_RESETCONTENT, 0, 0);
         SetWindowTextW(args.thread_header, default_header.as_ptr());
         SetWindowTextW(args.notice, empty.as_ptr());
+        SetWindowTextW(args.reply_label, empty.as_ptr());
+        ShowWindow(args.reply_label, SW_HIDE);
+        ShowWindow(args.reply_clear_btn, SW_HIDE);
         SetWindowTextW(args.input_edit, empty.as_ptr());
-        SetWindowTextW(args.byte_guide, default_guide.as_ptr());
         for (idx, part) in sb_parts.iter().enumerate() {
             let w = to_wide(part);
             SendMessageW(args.statusbar, SB_SETTEXTW, idx, w.as_ptr() as LPARAM);
@@ -808,8 +904,28 @@ pub(crate) fn handle_lv_getdispinfo(lparam: LPARAM, state: &UiState) {
         .try_with_message(&state.active_thread, row, |m| {
             Zeroizing::new(match col {
                 0 => m.sender_name.clone(),
-                1 => format_unix_time_hms(m.timestamp),
-                2 => summarize_message_body(&m.body, 70),
+                1 => {
+                    let mention_prefix = if !m.is_deleted
+                        && matches!(m.delivery, DeliveryState::Received)
+                        && contains_mention(&m.body, &state.display_name)
+                    {
+                        "[自分宛] "
+                    } else {
+                        ""
+                    };
+                    if !m.is_deleted
+                        && let Some(reply) = &m.reply_to
+                    {
+                        format!(
+                            "{mention_prefix}[返信: {}] {}",
+                            reply.sender_name,
+                            summarize_message_body(&m.body, 55)
+                        )
+                    } else {
+                        format!("{mention_prefix}{}", summarize_message_body(&m.body, 70))
+                    }
+                }
+                2 => format_unix_time_hms(m.timestamp),
                 3 => m.delivery.status_label(),
                 _ => String::new(),
             })
@@ -845,6 +961,9 @@ pub(crate) fn handle_peer_list_selchange() {
         if next_thread != state.active_thread {
             state.active_thread = next_thread;
             state.last_lv_count = 0;
+            state.pending_reply = None;
+            let parent = unsafe { GetParent(handles.main_input_edit) };
+            sync_reply_bar(parent, handles, state);
             refresh_peer_list(handles, state);
             sync_file_transfer_button(handles, state);
             Some(prepare_virtual_listview_sync(handles, state, true))
@@ -912,11 +1031,13 @@ pub(crate) fn send_current_input() {
             return None;
         }
         let thread = state.active_thread.clone();
+        let reply_to = state.pending_reply.clone();
         if state
             .cmd_tx
             .try_send(UiCommand::SendChat {
                 thread,
                 body: normalized,
+                reply_to,
             })
             .is_err()
         {
@@ -927,11 +1048,14 @@ pub(crate) fn send_current_input() {
             );
             return Some(handles.main_input_edit);
         }
+        if state.pending_reply.take().is_some() {
+            let parent = unsafe { GetParent(handles.main_input_edit) };
+            sync_reply_bar(parent, handles, state);
+        }
         let empty = to_wide("");
         unsafe {
             SetWindowTextW(handles.main_input_edit, empty.as_ptr());
         }
-        update_input_byte_guide(handles, state.config.send_on_enter);
         set_notice_text(handles, state, "");
         Some(handles.main_input_edit)
     })
@@ -977,7 +1101,11 @@ pub(crate) fn open_selected_message_detail(hwnd_parent: HWND) {
                             time_text: format_unix_datetime(m.timestamp),
                             status_text: m.delivery.status_label(),
                             body: m.body.clone(),
-                            can_retry: is_message_retryable(&m.delivery),
+                            can_retry: is_message_retryable(&m.delivery, m.is_deleted),
+                            reply_summary: m
+                                .reply_to
+                                .as_ref()
+                                .map(|r| format!("{}「{}」", r.sender_name, r.preview)),
                         },
                     )
                 })
@@ -1049,7 +1177,7 @@ pub(crate) fn retry_selected_message() {
         let found = state
             .log_reader
             .with_message(&state.active_thread, row, |m| {
-                is_message_retryable(&m.delivery).then(|| m.message_id.clone())
+                is_message_retryable(&m.delivery, m.is_deleted).then(|| m.message_id.clone())
             });
         if let Some(Some(message_id)) = found {
             let _ = state.cmd_tx.try_send(UiCommand::RetryChat {
@@ -1065,4 +1193,443 @@ pub(crate) fn retry_selected_message() {
             );
         }
     });
+}
+
+pub(crate) fn export_current_chat_log(hwnd_parent: HWND) {
+    let snapshot = with_ui_and_state_mut(|handles, state| {
+        if state.modal_open || state.app_state != AppStateKind::LoggedIn {
+            return None;
+        }
+        let messages = state
+            .log_reader
+            .export_thread_messages(&state.active_thread);
+        if messages.is_empty() {
+            set_notice_text(handles, state, "保存対象の会話メッセージがありません。");
+            return None;
+        }
+        let thread_label = match &state.active_thread {
+            ThreadKey::Broadcast => "全体チャット".to_string(),
+            ThreadKey::Peer(pid) => state
+                .peers
+                .iter()
+                .find(|p| &p.peer_id == pid)
+                .map_or_else(|| "1対1チャット".to_string(), |p| p.display_name.clone()),
+        };
+        state.modal_open = true;
+        Some((thread_label, messages))
+    })
+    .flatten();
+
+    let Some((thread_label, mut messages)) = snapshot else {
+        return;
+    };
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let default_name = default_chat_log_filename(&thread_label, now_secs);
+    let picked = pick_save_text_log_dialog(hwnd_parent, &default_name);
+
+    let notice_msg = if let Some(path) = picked {
+        let exported_at = format_unix_datetime(now_secs);
+        let text = format_chat_log_export_text(&thread_label, &exported_at, &messages);
+        let write_res = std::fs::write(&path, text.as_bytes());
+        drop(text);
+        Some(match write_res {
+            Ok(()) => format!("会話ログを保存しました: {}", path.display()),
+            Err(err) => format!("会話ログの保存に失敗しました: {err}"),
+        })
+    } else {
+        None
+    };
+
+    for msg in &mut messages {
+        msg.zeroize();
+    }
+    drop(messages);
+
+    let focus_target = with_ui_and_state_mut(|handles, state| {
+        state.modal_open = false;
+        if let Some(msg) = notice_msg {
+            set_notice_text(handles, state, &msg);
+        }
+        if !state.last_focus.is_null() {
+            state.last_focus
+        } else {
+            handles.main_input_edit
+        }
+    });
+
+    if let Some(target) = focus_target {
+        focus_control(target);
+    }
+    process_pending_file_offers(hwnd_parent);
+}
+
+pub(crate) fn show_chat_list_context_menu(hwnd_parent: HWND, lparam: LPARAM) {
+    const CMD_SHOW_DETAIL: i32 = 1;
+    const CMD_COPY_BODY: i32 = 2;
+    const CMD_RETRY_MESSAGE: i32 = 3;
+    const CMD_DELETE_MESSAGE: i32 = 4;
+    const CMD_REPLY_MESSAGE: i32 = 5;
+    const CMD_MENTION_SENDER: i32 = 6;
+
+    let ctx = with_ui_and_state_mut(|handles, state| {
+        if state.modal_open || state.app_state != AppStateKind::LoggedIn {
+            return None;
+        }
+        let row = get_selected_listview_index(handles.main_chat_list)?;
+        let (msg_id, sender_name, body, is_deleted, can_retry, can_delete) = state
+            .log_reader
+            .with_message(&state.active_thread, row, |m| {
+                (
+                    m.message_id.clone(),
+                    m.sender_name.clone(),
+                    Zeroizing::new(m.body.clone()),
+                    m.is_deleted,
+                    is_message_retryable(&m.delivery, m.is_deleted),
+                    !m.is_deleted && !matches!(m.delivery, DeliveryState::Received),
+                )
+            })?;
+        Some((
+            row,
+            msg_id,
+            sender_name,
+            body,
+            is_deleted,
+            can_retry,
+            can_delete,
+            state.active_thread.clone(),
+            state.dpi,
+            handles.main_chat_list,
+        ))
+    })
+    .flatten();
+
+    let Some((
+        row,
+        msg_id,
+        sender_name,
+        body,
+        is_deleted,
+        can_retry,
+        can_delete,
+        thread,
+        dpi,
+        hwnd_lv,
+    )) = ctx
+    else {
+        return;
+    };
+
+    let mut x = (lparam & 0xFFFF) as i16 as i32;
+    let mut y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+    if x == -1 && y == -1 {
+        let mut rc: RECT = unsafe { std::mem::zeroed() };
+        rc.left = LVIR_BOUNDS as i32;
+        let ok = unsafe { SendMessageW(hwnd_lv, LVM_GETITEMRECT, row, &raw mut rc as LPARAM) };
+        if ok != 0 {
+            let mut pt = POINT {
+                x: rc.left + 24,
+                y: rc.bottom,
+            };
+            unsafe {
+                ClientToScreen(hwnd_lv, &raw mut pt);
+            }
+            x = pt.x;
+            y = pt.y;
+        } else {
+            let mut wr: RECT = unsafe { std::mem::zeroed() };
+            unsafe {
+                GetWindowRect(hwnd_lv, &raw mut wr);
+            }
+            x = wr.left + 24;
+            y = wr.top + 24;
+        }
+    }
+
+    let cmd = unsafe {
+        let hmenu = CreatePopupMenu();
+        if hmenu.is_null() {
+            return;
+        }
+        let w_detail = to_wide("メッセージの詳細を表示(&V)");
+        let w_reply = to_wide("このメッセージに返信(&R)");
+        let w_mention = to_wide(&format!("@{sender_name} でメンション(&M)"));
+        let w_copy = to_wide("本文をコピー(&C)");
+        let w_retry = to_wide("未達メッセージを再送(&T)");
+        let w_delete = to_wide("メッセージを削除(&D)");
+
+        AppendMenuW(
+            hmenu,
+            MF_STRING,
+            CMD_SHOW_DETAIL as usize,
+            w_detail.as_ptr(),
+        );
+        AppendMenuW(
+            hmenu,
+            MF_STRING | if !is_deleted { 0 } else { MF_GRAYED },
+            CMD_REPLY_MESSAGE as usize,
+            w_reply.as_ptr(),
+        );
+        AppendMenuW(
+            hmenu,
+            MF_STRING,
+            CMD_MENTION_SENDER as usize,
+            w_mention.as_ptr(),
+        );
+        AppendMenuW(hmenu, MF_STRING, CMD_COPY_BODY as usize, w_copy.as_ptr());
+        AppendMenuW(
+            hmenu,
+            MF_STRING | if can_retry { 0 } else { MF_GRAYED },
+            CMD_RETRY_MESSAGE as usize,
+            w_retry.as_ptr(),
+        );
+        AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            hmenu,
+            MF_STRING | if can_delete { 0 } else { MF_GRAYED },
+            CMD_DELETE_MESSAGE as usize,
+            w_delete.as_ptr(),
+        );
+
+        let selected = TrackPopupMenu(
+            hmenu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+            x,
+            y,
+            0,
+            hwnd_parent,
+            null(),
+        );
+        DestroyMenu(hmenu);
+        selected
+    };
+
+    match cmd {
+        CMD_SHOW_DETAIL => open_selected_message_detail(hwnd_parent),
+        CMD_REPLY_MESSAGE if !is_deleted => {
+            let focus_target = with_ui_and_state_mut(|handles, state| {
+                if state.app_state != AppStateKind::LoggedIn {
+                    return None;
+                }
+                state.pending_reply = Some(ReplyReference {
+                    message_id: msg_id,
+                    sender_name,
+                    preview: sanitize_reply_preview(&body),
+                });
+                sync_reply_bar(hwnd_parent, handles, state);
+                Some(handles.main_input_edit)
+            })
+            .flatten();
+            if let Some(target) = focus_target {
+                focus_control(target);
+            }
+        }
+        CMD_MENTION_SENDER => {
+            let focus_target = with_ui_and_state(|handles, state| {
+                if state.app_state != AppStateKind::LoggedIn {
+                    return None;
+                }
+                insert_mention_into_input(handles.main_input_edit, &sender_name);
+                Some(handles.main_input_edit)
+            })
+            .flatten();
+            if let Some(target) = focus_target {
+                focus_control(target);
+            }
+        }
+        CMD_COPY_BODY => {
+            let ok = copy_text_to_clipboard(hwnd_parent, &body);
+            with_ui_and_state_mut(|handles, state| {
+                if ok {
+                    set_notice_text(
+                        handles,
+                        state,
+                        "メッセージ本文をクリップボードにコピーしました。",
+                    );
+                } else {
+                    set_notice_text(handles, state, "クリップボードへのコピーに失敗しました。");
+                }
+            });
+        }
+        CMD_RETRY_MESSAGE => retry_selected_message(),
+        CMD_DELETE_MESSAGE if can_delete => {
+            let entered = with_state_mut(|state| {
+                if state.modal_open || state.app_state != AppStateKind::LoggedIn {
+                    return false;
+                }
+                state.modal_open = true;
+                true
+            })
+            .unwrap_or(false);
+            if !entered {
+                return;
+            }
+            let confirmed = confirm_delete_message(hwnd_parent, dpi);
+            with_ui_and_state_mut(|handles, state| {
+                state.modal_open = false;
+                if confirmed && state.app_state == AppStateKind::LoggedIn {
+                    let _ = state.cmd_tx.try_send(UiCommand::DeleteMessage {
+                        thread,
+                        message_id: msg_id,
+                    });
+                    set_notice_text(handles, state, "メッセージを削除しました。");
+                }
+            });
+            focus_control(hwnd_lv);
+            process_pending_file_offers(hwnd_parent);
+        }
+        _ => {}
+    }
+}
+
+fn insert_mention_into_input(hwnd_input: HWND, display_name: &str) {
+    if hwnd_input.is_null() || display_name.trim().is_empty() {
+        return;
+    }
+    let mention = format!("@{} ", display_name.trim());
+    let w = to_wide(&mention);
+    unsafe {
+        SendMessageW(hwnd_input, EM_REPLACESEL, 1, w.as_ptr() as LPARAM);
+    }
+}
+
+pub(crate) fn show_mention_picker_menu(hwnd_parent: HWND) {
+    let ctx = with_ui_and_state_mut(|handles, state| {
+        if state.modal_open || state.app_state != AppStateKind::LoggedIn {
+            return None;
+        }
+        let online: Vec<String> = state
+            .peers
+            .iter()
+            .filter(|p| p.is_online)
+            .map(|p| p.display_name.clone())
+            .collect();
+        if online.is_empty() {
+            set_notice_text(handles, state, "現在オンラインの相手がいません。");
+            return None;
+        }
+        Some((online, handles.main_input_edit))
+    })
+    .flatten();
+
+    let Some((online, hwnd_input)) = ctx else {
+        return;
+    };
+
+    let mut wr: RECT = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetWindowRect(hwnd_input, &raw mut wr);
+    }
+
+    let selected_idx = unsafe {
+        let hmenu = CreatePopupMenu();
+        if hmenu.is_null() {
+            return;
+        }
+        for (i, name) in online.iter().enumerate() {
+            let label = to_wide(&format!("@{name}"));
+            AppendMenuW(hmenu, MF_STRING, i + 1, label.as_ptr());
+        }
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+            wr.left + 8,
+            wr.top + 8,
+            0,
+            hwnd_parent,
+            null(),
+        );
+        DestroyMenu(hmenu);
+        cmd
+    };
+
+    if selected_idx > 0
+        && let Some(name) = online.get((selected_idx as usize) - 1)
+    {
+        insert_mention_into_input(hwnd_input, name);
+        focus_control(hwnd_input);
+    }
+}
+
+pub(crate) fn show_peer_list_context_menu(hwnd_parent: HWND, lparam: LPARAM) {
+    let ctx = with_ui_and_state(|handles, state| {
+        if state.modal_open || state.app_state != AppStateKind::LoggedIn {
+            return None;
+        }
+        let sel = unsafe { SendMessageW(handles.main_peer_list, LB_GETCURSEL, 0, 0) };
+        if sel <= 0 {
+            return None;
+        }
+        let peer = state.peers.get((sel as usize) - 1)?;
+        Some((
+            peer.display_name.clone(),
+            handles.main_peer_list,
+            handles.main_input_edit,
+        ))
+    })
+    .flatten();
+
+    let Some((display_name, hwnd_peer_list, hwnd_input)) = ctx else {
+        return;
+    };
+
+    let mut x = (lparam & 0xFFFF) as i16 as i32;
+    let mut y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+    if x == -1 && y == -1 {
+        let mut wr: RECT = unsafe { std::mem::zeroed() };
+        unsafe {
+            GetWindowRect(hwnd_peer_list, &raw mut wr);
+        }
+        x = wr.left + 24;
+        y = wr.top + 24;
+    }
+
+    let cmd = unsafe {
+        let hmenu = CreatePopupMenu();
+        if hmenu.is_null() {
+            return;
+        }
+        let w_mention = to_wide(&format!("@{display_name} でメンション(&M)"));
+        AppendMenuW(hmenu, MF_STRING, 1, w_mention.as_ptr());
+        let selected = TrackPopupMenu(
+            hmenu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+            x,
+            y,
+            0,
+            hwnd_parent,
+            null(),
+        );
+        DestroyMenu(hmenu);
+        selected
+    };
+
+    if cmd == 1 {
+        insert_mention_into_input(hwnd_input, &display_name);
+        focus_control(hwnd_input);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_autoscroll_to_tail;
+
+    #[test]
+    fn autoscroll_follows_tail_on_append_and_memory_eviction() {
+        assert!(should_autoscroll_to_tail(0, 5, None, true));
+        assert!(should_autoscroll_to_tail(10, 11, None, true));
+        assert!(should_autoscroll_to_tail(10, 11, Some(9), true));
+        // メモリ上限退避により件数が維持・減少した場合でも末尾追従する
+        assert!(should_autoscroll_to_tail(50, 50, Some(49), true));
+        assert!(should_autoscroll_to_tail(50, 48, Some(49), true));
+        assert!(should_autoscroll_to_tail(50, 48, None, true));
+        // 過去メッセージ閲覧中は追従しない
+        assert!(!should_autoscroll_to_tail(50, 51, Some(10), true));
+        assert!(!should_autoscroll_to_tail(50, 48, Some(10), true));
+        // 自動スクロール不許可・空スレッドは追従しない
+        assert!(!should_autoscroll_to_tail(10, 11, None, false));
+        assert!(!should_autoscroll_to_tail(5, 0, Some(4), true));
+    }
 }

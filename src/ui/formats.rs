@@ -10,35 +10,11 @@ use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
-use zerohop::domain::model::{DeliveryState, MAX_CHAT_BODY_BYTES, PeerView, ThreadKey};
+use zerohop::domain::model::{DeliveryState, InMemoryChatMessage, PeerView, ThreadKey};
 use zerohop::network::nic::NicInfo;
+use zeroize::Zeroizing;
 
 use super::state_helpers::UiState;
-
-pub(crate) fn normalized_utf8_byte_len(raw: &str) -> usize {
-    let mut bytes = 0usize;
-    let mut prev_cr = false;
-    for ch in raw.chars() {
-        if ch == '\r' {
-            bytes += 1;
-            prev_cr = true;
-            continue;
-        }
-        if ch == '\n' {
-            if prev_cr {
-                prev_cr = false;
-                continue;
-            }
-            bytes += 1;
-            continue;
-        }
-        prev_cr = false;
-        if ch == '\t' || !ch.is_control() {
-            bytes += ch.len_utf8();
-        }
-    }
-    bytes
-}
 
 fn unix_ts_to_local_systemtime(ts: i64) -> Option<SYSTEMTIME> {
     if ts < 0 {
@@ -108,6 +84,64 @@ pub(crate) fn normalize_crlf(body: &str) -> String {
     body.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+fn sanitize_filename_segment(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+        if out.chars().count() >= 40 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    if trimmed.is_empty() {
+        "chat".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn default_chat_log_filename(thread_label: &str, now_unix_secs: i64) -> String {
+    let safe_label = sanitize_filename_segment(thread_label);
+    let stamp = if let Some(st) = unix_ts_to_local_systemtime(now_unix_secs) {
+        format!(
+            "{:04}{:02}{:02}_{:02}{:02}{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    } else {
+        "00000000_000000".to_string()
+    };
+    format!("ZeroHop_{safe_label}_{stamp}.txt")
+}
+
+pub(crate) fn format_chat_log_export_text(
+    thread_label: &str,
+    exported_at_text: &str,
+    messages: &[InMemoryChatMessage],
+) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::new());
+    out.push_str("ZeroHop 会話ログ\r\n");
+    out.push_str(&format!("スレッド: {thread_label}\r\n"));
+    out.push_str(&format!("出力日時: {exported_at_text}\r\n"));
+    out.push_str(&format!("件数: {}件\r\n", messages.len()));
+    out.push_str("----------------------------------------\r\n");
+    for msg in messages {
+        let dt = format_unix_datetime(msg.timestamp);
+        let body_crlf = Zeroizing::new(normalize_crlf(&msg.body));
+        if let Some(reply) = &msg.reply_to {
+            out.push_str(&format!(
+                "  返信先: {}「{}」\r\n",
+                reply.sender_name, reply.preview
+            ));
+        }
+        out.push_str(&format!("[{dt}] {}: {}\r\n", msg.sender_name, *body_crlf));
+    }
+    out
+}
+
 pub(crate) fn format_bytes_human(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -118,25 +152,10 @@ pub(crate) fn format_bytes_human(bytes: usize) -> String {
     }
 }
 
-pub(crate) fn format_remaining_bytes_label(
-    current_utf8_bytes: usize,
-    send_on_enter: bool,
-) -> String {
-    let hint = if send_on_enter {
-        "送信: Enter / 改行: Shift+Enter"
-    } else {
-        "送信: Ctrl+Enter / 改行: Enter"
-    };
-    if current_utf8_bytes <= MAX_CHAT_BODY_BYTES {
-        let rem = MAX_CHAT_BODY_BYTES - current_utf8_bytes;
-        format!("残り {rem} / {MAX_CHAT_BODY_BYTES} バイト（{hint}）")
-    } else {
-        let over = current_utf8_bytes - MAX_CHAT_BODY_BYTES;
-        format!("上限を {over} バイト超過しています（最大 {MAX_CHAT_BODY_BYTES} バイト）")
+pub(crate) fn is_message_retryable(delivery: &DeliveryState, is_deleted: bool) -> bool {
+    if is_deleted {
+        return false;
     }
-}
-
-pub(crate) fn is_message_retryable(delivery: &DeliveryState) -> bool {
     match delivery {
         DeliveryState::DirectFailed | DeliveryState::DirectSending => true,
         DeliveryState::Broadcast {
@@ -288,16 +307,10 @@ mod tests {
     }
 
     #[test]
-    fn format_bytes_human_and_remaining_guide() {
+    fn format_bytes_human_formats_units() {
         assert_eq!(format_bytes_human(512), "512 B");
         assert_eq!(format_bytes_human(1536), "1.5 KB");
         assert_eq!(format_bytes_human(2 * 1024 * 1024), "2.00 MB");
-        let label_ctrl = format_remaining_bytes_label(100, false);
-        assert!(label_ctrl.contains("3996 / 4096"));
-        assert!(label_ctrl.contains("送信: Ctrl+Enter"));
-        let label_enter = format_remaining_bytes_label(100, true);
-        assert!(label_enter.contains("送信: Enter / 改行: Shift+Enter"));
-        assert!(format_remaining_bytes_label(4100, false).contains("4 バイト超過"));
     }
 
     #[test]
@@ -314,23 +327,33 @@ mod tests {
 
     #[test]
     fn delivery_retryable_and_thread_migration_follow_rules() {
-        assert!(!is_message_retryable(&DeliveryState::Received));
-        assert!(!is_message_retryable(&DeliveryState::DirectDelivered));
-        assert!(is_message_retryable(&DeliveryState::DirectFailed));
-        assert!(is_message_retryable(&DeliveryState::DirectSending));
+        assert!(!is_message_retryable(&DeliveryState::Received, false));
+        assert!(!is_message_retryable(
+            &DeliveryState::DirectDelivered,
+            false
+        ));
+        assert!(is_message_retryable(&DeliveryState::DirectFailed, false));
+        assert!(is_message_retryable(&DeliveryState::DirectSending, false));
+        assert!(!is_message_retryable(&DeliveryState::DirectFailed, true));
 
         let mut acked = HashSet::new();
         acked.insert("p1".to_string());
-        assert!(!is_message_retryable(&DeliveryState::Broadcast {
-            target_count: 1,
-            acked_peers: acked.clone(),
-            failed_peers: Vec::new(),
-        }));
-        assert!(is_message_retryable(&DeliveryState::Broadcast {
-            target_count: 2,
-            acked_peers: acked,
-            failed_peers: vec!["p2".to_string()],
-        }));
+        assert!(!is_message_retryable(
+            &DeliveryState::Broadcast {
+                target_count: 1,
+                acked_peers: acked.clone(),
+                failed_peers: Vec::new(),
+            },
+            false,
+        ));
+        assert!(is_message_retryable(
+            &DeliveryState::Broadcast {
+                target_count: 2,
+                acked_peers: acked,
+                failed_peers: vec!["p2".to_string()],
+            },
+            false,
+        ));
 
         let formal = PeerView {
             peer_id: "uuid-bob".to_string(),
@@ -356,21 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_utf8_byte_len_matches_validated_chat_body_len() {
-        for sample in [
-            "こんにちは\r\n2行目\r\t項目\x07\x1b末尾",
-            "絵文字😊と日本語",
-            "line1\nline2",
-        ] {
-            let expected = zerohop::domain::validation::validate_chat_body(sample)
-                .unwrap()
-                .len();
-            assert_eq!(normalized_utf8_byte_len(sample), expected);
-        }
-        assert_eq!(normalized_utf8_byte_len("\x00\x07\r"), 1);
-    }
-
-    #[test]
     fn loopback_connectivity_diagnostic_reports_ok_for_bound_listener_and_zero_port() {
         let zero = run_loopback_connectivity_diagnostic(0, None);
         assert!(zero.contains("未待受"));
@@ -381,5 +389,60 @@ mod tests {
         let ok = run_loopback_connectivity_diagnostic(port, None);
         assert!(ok.contains("ループバックTCP待受応答: OK"));
         drop(listener);
+    }
+
+    #[test]
+    fn default_chat_log_filename_sanitizes_forbidden_windows_chars() {
+        let name = default_chat_log_filename("Alice<>:\"/\\|?* .", 1_700_000_000);
+        assert!(name.starts_with("ZeroHop_Alice"));
+        assert!(name.ends_with(".txt"));
+        let stem = name.trim_start_matches("ZeroHop_");
+        assert!(!stem.contains('<'));
+        assert!(!stem.contains('>'));
+        assert!(!stem.contains(':'));
+        assert!(!stem.contains('"'));
+        assert!(!stem.contains('/'));
+        assert!(!stem.contains('\\'));
+        assert!(!stem.contains('|'));
+        assert!(!stem.contains('?'));
+        assert!(!stem.contains('*'));
+
+        let empty_name = default_chat_log_filename("...   ", 1_700_000_000);
+        assert!(empty_name.starts_with("ZeroHop_chat_"));
+    }
+
+    #[test]
+    fn format_chat_log_export_text_uses_crlf_and_expected_header() {
+        let m1 = InMemoryChatMessage::new(
+            "id-1",
+            "peer-a",
+            "Alice",
+            "1行目\n2行目",
+            1_700_000_000,
+            DeliveryState::Received,
+        );
+        let m2 = InMemoryChatMessage::new(
+            "id-2",
+            "me",
+            "自分",
+            "了解しました",
+            1_700_000_060,
+            DeliveryState::DirectDelivered,
+        )
+        .with_reply_to(Some(zerohop::domain::model::ReplyReference {
+            message_id: "id-1".to_string(),
+            sender_name: "Alice".to_string(),
+            preview: "1行目 2行目".to_string(),
+        }));
+        let text = format_chat_log_export_text("Alice", "2026-11-26 12:00:00", &[m1, m2]);
+        assert!(text.contains("ZeroHop 会話ログ\r\n"));
+        assert!(text.contains("スレッド: Alice\r\n"));
+        assert!(text.contains("出力日時: 2026-11-26 12:00:00\r\n"));
+        assert!(text.contains("件数: 2件\r\n"));
+        assert!(text.contains("Alice: 1行目\r\n2行目\r\n"));
+        assert!(text.contains("  返信先: Alice「1行目 2行目」\r\n"));
+        assert!(text.contains("自分: 了解しました\r\n"));
+        // 単独 LF が残っていないこと
+        assert!(!text.replace("\r\n", "").contains('\n'));
     }
 }

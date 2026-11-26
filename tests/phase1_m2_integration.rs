@@ -168,6 +168,7 @@ async fn manual_peer_hello_direct_ack_and_broadcast_selective_retry() {
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(bob_id.clone()),
             body: Zeroizing::new("1対1の暗号化メッセージ".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();
@@ -249,6 +250,7 @@ async fn manual_peer_hello_direct_ack_and_broadcast_selective_retry() {
         .send(UiCommand::SendChat {
             thread: ThreadKey::Broadcast,
             body: Zeroizing::new("全体チャット集合Ackテスト".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();
@@ -462,6 +464,9 @@ async fn unauthenticated_and_tampered_packets_are_rejected_and_anomalies_rate_li
         is_broadcast: true,
         body: "未来時刻メッセージ".to_string(),
         timestamp: current_unix_timestamp() + 600,
+        reply_to_id: None,
+        reply_to_sender: None,
+        reply_to_preview: None,
     };
     send_tcp_control_frame(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), n2_tcp),
@@ -599,6 +604,7 @@ async fn full_login_chat_logout_relogin_lifecycle() {
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(peer_id1.clone()),
             body: Zeroizing::new("セッション1の会話".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();
@@ -653,6 +659,7 @@ async fn full_login_chat_logout_relogin_lifecycle() {
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(peer_id2),
             body: Zeroizing::new("セッション2の会話".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();
@@ -686,6 +693,7 @@ async fn zero_persistence_leaves_no_files_and_cleans_residual_cache() {
         .send(UiCommand::SendChat {
             thread: ThreadKey::Broadcast,
             body: Zeroizing::new("極秘の会話メッセージXYZ".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();
@@ -910,6 +918,9 @@ async fn sec001_sec005_blocks_reflection_replay_manual_promotion_and_sanitizes_c
             is_broadcast: true,
             body: "拒否されるべき長大ID".to_string(),
             timestamp: current_unix_timestamp(),
+            reply_to_id: None,
+            reply_to_sender: None,
+            reply_to_preview: None,
         },
     )
     .await
@@ -925,6 +936,9 @@ async fn sec001_sec005_blocks_reflection_replay_manual_promotion_and_sanitizes_c
             is_broadcast: true,
             body: "安全\r\n本文\x00\x1b[31mOK".to_string(),
             timestamp: current_unix_timestamp(),
+            reply_to_id: None,
+            reply_to_sender: None,
+            reply_to_preview: None,
         },
     )
     .await

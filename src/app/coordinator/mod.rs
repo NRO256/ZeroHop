@@ -101,6 +101,14 @@ impl SessionLogReader {
         guard.current_total_bytes()
     }
 
+    pub fn export_thread_messages(&self, thread: &ThreadKey) -> Vec<InMemoryChatMessage> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.export_thread_messages(thread)
+    }
+
     pub fn search(
         &self,
         thread_filter: Option<&ThreadKey>,
@@ -425,15 +433,25 @@ impl Coordinator {
                     .await
             }
             UiCommand::CancelLogin => false,
-            UiCommand::SendChat { thread, body } => {
+            UiCommand::SendChat {
+                thread,
+                body,
+                reply_to,
+            } => {
                 if self.state == AppStateKind::LoggedIn {
-                    self.handle_send_chat(thread, body, internal_tx);
+                    self.handle_send_chat(thread, body, reply_to, internal_tx);
                 }
                 false
             }
             UiCommand::RetryChat { thread, message_id } => {
                 if self.state == AppStateKind::LoggedIn {
                     self.handle_retry_chat(thread, message_id, internal_tx);
+                }
+                false
+            }
+            UiCommand::DeleteMessage { thread, message_id } => {
+                if self.state == AppStateKind::LoggedIn {
+                    self.handle_delete_message(thread, message_id);
                 }
                 false
             }

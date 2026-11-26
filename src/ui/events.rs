@@ -27,8 +27,7 @@ use super::login_view::{
 use super::main_view::{
     LvSyncArgs, apply_clear_main_controls, apply_virtual_listview_sync, clear_unread_for_thread,
     extract_clear_main_args, prepare_virtual_listview_sync, refresh_peer_list,
-    set_input_send_on_enter, set_notice_text, show_main_controls, update_input_byte_guide,
-    update_status_bar,
+    set_input_send_on_enter, set_notice_text, show_main_controls, update_status_bar,
 };
 use super::menu_bar::{sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check};
 use super::sound::{SoundEvent, play_logout_on_exit_sync, play_sound_if_allowed};
@@ -152,9 +151,9 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     refresh_peer_list(handles, state);
                     sync_file_transfer_button(handles, state);
                     let lv = prepare_virtual_listview_sync(handles, state, true);
-                    update_input_byte_guide(handles, state.config.send_on_enter);
                     set_notice_text(handles, state, "");
                     state.last_focus = handles.main_input_edit;
+                    state.pending_reply = None;
                     state.sound.mark_login_at(Instant::now());
                     play_sound_if_allowed(
                         &mut state.sound,
@@ -233,6 +232,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                 thread,
                 sender_name,
                 preview,
+                is_mentioned,
             } => {
                 let uia_text = with_ui_and_state_mut(|handles, state| {
                     if !matches!(
@@ -270,7 +270,16 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                             let (title, body) = if state.config.hide_notification_preview {
                                 (
                                     "ZeroHop".to_string(),
-                                    "新着メッセージがあります".to_string(),
+                                    if is_mentioned {
+                                        "あなた宛のメンションがあります".to_string()
+                                    } else {
+                                        "新着メッセージがあります".to_string()
+                                    },
+                                )
+                            } else if is_mentioned {
+                                (
+                                    format!("{sender_name} があなたをメンション"),
+                                    format!("{sender_name} があなたをメンション: {preview}"),
                                 )
                             } else {
                                 (format!("新着メッセージ: {sender_name}"), preview.clone())
@@ -284,7 +293,13 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         }
                         if state.config.uia_announce_incoming {
                             return Some(if state.config.hide_notification_preview {
-                                "新着メッセージがあります".to_string()
+                                if is_mentioned {
+                                    "あなた宛のメンションがあります".to_string()
+                                } else {
+                                    "新着メッセージがあります".to_string()
+                                }
+                            } else if is_mentioned {
+                                format!("{sender_name} があなたをメンション: {preview}")
                             } else {
                                 format!("{sender_name}: {preview}")
                             });
@@ -318,6 +333,7 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                     }
                     show_lock_controls(handles, true);
                     state.last_lv_count = 0;
+                    state.pending_reply = None;
                     state.last_focus = handles.lock_pass_edit;
                     (
                         LvSyncArgs {
@@ -359,7 +375,6 @@ pub(crate) fn drain_app_events(hwnd: HWND) {
                         state.total_log_bytes = state.log_reader.total_bytes();
                         refresh_peer_list(handles, state);
                         sync_file_transfer_button(handles, state);
-                        update_input_byte_guide(handles, state.config.send_on_enter);
                         let lv = prepare_virtual_listview_sync(handles, state, true);
                         state.last_focus = handles.main_input_edit;
                         (lv, handles.main_input_edit)

@@ -37,9 +37,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsDialogMessageW, KillTimer, LBN_SELCHANGE, LoadCursorW, MINMAXINFO, MSG, PostMessageW,
     PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
     SetMenu, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_GETMINMAXINFO, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
-    WNDCLASSEXW, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_GETMINMAXINFO, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -56,9 +56,9 @@ use dialogs::{
 };
 use events::{drain_app_events, remove_tray_icon};
 pub(crate) use formats::{
-    build_connection_info_text, format_bytes_human, format_remaining_bytes_label,
-    format_unix_datetime, format_unix_time_hms, is_message_retryable, normalize_crlf,
-    normalized_utf8_byte_len, resolve_migrated_thread, summarize_message_body,
+    build_connection_info_text, default_chat_log_filename, format_bytes_human,
+    format_chat_log_export_text, format_unix_datetime, format_unix_time_hms, is_message_retryable,
+    normalize_crlf, resolve_migrated_thread, summarize_message_body,
 };
 use lock_view::{create_lock_controls, layout_lock_controls, show_lock_controls, submit_unlock};
 use login_view::{
@@ -67,12 +67,13 @@ use login_view::{
     update_password_guide,
 };
 use main_view::{
-    apply_clear_main_controls, apply_virtual_listview_sync, clear_unread_for_thread,
-    create_main_controls, extract_clear_main_args, handle_lv_getdispinfo,
-    handle_peer_list_selchange, jump_to_search_hit, layout_main_controls,
-    open_selected_message_detail, prepare_virtual_listview_sync, refresh_peer_list,
-    remove_main_subclasses, retry_selected_message, send_current_input, set_input_send_on_enter,
-    set_notice_text, show_main_controls, update_input_byte_guide, update_status_bar,
+    apply_clear_main_controls, apply_virtual_listview_sync, clear_pending_reply_and_relayout,
+    clear_unread_for_thread, create_main_controls, export_current_chat_log,
+    extract_clear_main_args, handle_lv_getdispinfo, handle_peer_list_selchange, jump_to_search_hit,
+    layout_main_controls, open_selected_message_detail, prepare_virtual_listview_sync,
+    refresh_peer_list, remove_main_subclasses, retry_selected_message, send_current_input,
+    set_input_send_on_enter, set_notice_text, show_chat_list_context_menu, show_main_controls,
+    show_mention_picker_menu, show_peer_list_context_menu, update_status_bar,
 };
 use menu_bar::{
     create_main_menu_bar, sync_menu_enabled_state, sync_option_menu_checks, sync_status_menu_check,
@@ -142,6 +143,8 @@ pub(crate) const IDM_TOGGLE_SOUND: usize = 1018;
 pub(crate) const IDM_TOGGLE_SEND_ON_ENTER: usize = 1019;
 pub(crate) const IDM_SEND_FILE: usize = 1020;
 pub(crate) const IDM_CANCEL_FILE_TRANSFER: usize = 1021;
+pub(crate) const IDM_EXPORT_CHAT_LOG: usize = 1022;
+pub(crate) const IDM_INSERT_MENTION: usize = 1023;
 
 // ログイン画面コントロール ID
 pub(crate) const IDC_LOGIN_TITLE: usize = 2001;
@@ -163,11 +166,12 @@ pub(crate) const IDC_MAIN_PEER_LIST: usize = 3002;
 pub(crate) const IDC_MAIN_THREAD_HEADER: usize = 3003;
 pub(crate) const IDC_MAIN_NOTICE: usize = 3004;
 pub(crate) const IDC_MAIN_CHAT_LIST: usize = 3005;
-pub(crate) const IDC_MAIN_BYTE_GUIDE: usize = 3006;
 pub(crate) const IDC_MAIN_INPUT_EDIT: usize = 3007;
 pub(crate) const IDC_MAIN_SEND_BTN: usize = 3008;
 pub(crate) const IDC_MAIN_STATUSBAR: usize = 3009;
 pub(crate) const IDC_MAIN_FILE_BTN: usize = 3010;
+pub(crate) const IDC_MAIN_REPLY_LABEL: usize = 3011;
+pub(crate) const IDC_MAIN_REPLY_CLEAR_BTN: usize = 3012;
 
 // ロック画面コントロール ID (Phase 2)
 pub(crate) const IDC_LOCK_TITLE: usize = 4001;
@@ -336,7 +340,6 @@ fn handle_options_modal(hwnd: HWND) {
                 || new_cfg.preferred_nic_ip != state.config.preferred_nic_ip;
             state.config = new_cfg.clone();
             set_input_send_on_enter(handles.main_input_edit, state.config.send_on_enter);
-            update_input_byte_guide(handles, state.config.send_on_enter);
             sync_option_menu_checks(handles.hmenu_main, &state.config);
             let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(new_cfg));
             if state.app_state == AppStateKind::LoggedIn {
@@ -700,7 +703,8 @@ unsafe extern "system" fn main_wnd_proc(
                     main_thread_header: main_ctrls.thread_header,
                     main_notice: main_ctrls.notice,
                     main_chat_list: main_ctrls.chat_list,
-                    main_byte_guide: main_ctrls.byte_guide,
+                    main_reply_label: main_ctrls.reply_label,
+                    main_reply_clear_btn: main_ctrls.reply_clear_btn,
                     main_input_edit: main_ctrls.input_edit,
                     main_send_btn: main_ctrls.send_btn,
                     main_file_btn: main_ctrls.file_btn,
@@ -750,6 +754,7 @@ unsafe extern "system" fn main_wnd_proc(
                     auto_logout_sent: false,
                     pending_delivery_sync: false,
                     delivery_debounce_timer_active: false,
+                    pending_reply: None,
                 };
                 if let Ok(mut slot) = init_box.join_slot.lock() {
                     *slot = Some(app_handle.join_handle);
@@ -978,18 +983,16 @@ unsafe extern "system" fn main_wnd_proc(
                         handle_peer_list_selchange();
                         return 0;
                     }
-                    IDC_MAIN_INPUT_EDIT if code == EN_CHANGE => {
-                        with_ui_and_state(|handles, state| {
-                            update_input_byte_guide(handles, state.config.send_on_enter);
-                        });
-                        return 0;
-                    }
                     IDC_MAIN_SEND_BTN if code == BN_CLICKED => {
                         send_current_input();
                         return 0;
                     }
                     IDC_MAIN_FILE_BTN if code == BN_CLICKED => {
                         handle_file_button_clicked(hwnd);
+                        return 0;
+                    }
+                    IDC_MAIN_REPLY_CLEAR_BTN if code == BN_CLICKED => {
+                        clear_pending_reply_and_relayout(hwnd);
                         return 0;
                     }
                     IDC_LOCK_UNLOCK_BTN if code == BN_CLICKED => {
@@ -1049,7 +1052,6 @@ unsafe extern "system" fn main_wnd_proc(
                             state.config.send_on_enter = !state.config.send_on_enter;
                             let next = state.config.clone();
                             set_input_send_on_enter(handles.main_input_edit, next.send_on_enter);
-                            update_input_byte_guide(handles, next.send_on_enter);
                             sync_option_menu_checks(handles.hmenu_main, &next);
                             let _ = state.cmd_tx.try_send(UiCommand::UpdateConfig(next));
                         });
@@ -1069,6 +1071,14 @@ unsafe extern "system" fn main_wnd_proc(
                     }
                     IDM_RETRY_SELECTED => {
                         retry_selected_message();
+                        return 0;
+                    }
+                    IDM_EXPORT_CHAT_LOG => {
+                        export_current_chat_log(hwnd);
+                        return 0;
+                    }
+                    IDM_INSERT_MENTION => {
+                        show_mention_picker_menu(hwnd);
                         return 0;
                     }
                     IDM_CLEAR_CURRENT => {
@@ -1176,6 +1186,31 @@ unsafe extern "system" fn main_wnd_proc(
                             return 0;
                         }
                     }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_CONTEXTMENU => {
+                let target = with_ui(|handles| {
+                    let src = wparam as HWND;
+                    if !handles.main_chat_list.is_null() && src == handles.main_chat_list {
+                        Some(1)
+                    } else if !handles.main_peer_list.is_null() && src == handles.main_peer_list {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                })
+                .flatten();
+                match target {
+                    Some(1) => {
+                        show_chat_list_context_menu(hwnd, lparam);
+                        return 0;
+                    }
+                    Some(2) => {
+                        show_peer_list_context_menu(hwnd, lparam);
+                        return 0;
+                    }
+                    _ => {}
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

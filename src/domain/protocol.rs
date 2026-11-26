@@ -133,6 +133,12 @@ pub enum TcpPayload {
         is_broadcast: bool,
         body: String,
         timestamp: i64,
+        #[serde(default)]
+        reply_to_id: Option<String>,
+        #[serde(default)]
+        reply_to_sender: Option<String>,
+        #[serde(default)]
+        reply_to_preview: Option<String>,
     },
     Ack {
         message_id: String,
@@ -156,6 +162,12 @@ pub enum TcpPayload {
     FileCancel {
         transfer_id: String,
         sender_id: String,
+        timestamp: i64,
+    },
+    DeleteMessage {
+        message_id: String,
+        sender_id: String,
+        is_broadcast: bool,
         timestamp: i64,
     },
 }
@@ -576,6 +588,9 @@ mod tests {
                 is_broadcast: false,
                 body: "暗号化バイナリフレーム".to_string(),
                 timestamp: 101,
+                reply_to_id: Some("m0".to_string()),
+                reply_to_sender: Some("Bob".to_string()),
+                reply_to_preview: Some("元メッセージ".to_string()),
             },
             TcpPayload::Ack {
                 message_id: "m1".to_string(),
@@ -595,6 +610,12 @@ mod tests {
                 sender_id: "p2".to_string(),
                 accepted: true,
                 timestamp: 104,
+            },
+            TcpPayload::DeleteMessage {
+                message_id: "m1".to_string(),
+                sender_id: "p1".to_string(),
+                is_broadcast: true,
+                timestamp: 105,
             },
         ];
 
@@ -667,6 +688,28 @@ mod tests {
         assert_eq!(
             decode_tcp_file_chunk_frame(&msg_key, &tampered),
             Err(ProtocolError::DecryptionFailed)
+        );
+    }
+
+    #[test]
+    fn legacy_chat_json_without_reply_fields_decodes_backward_compatibly() {
+        let msg_key = [0x44u8; 32];
+        let legacy_json = br#"{"kind":"Chat","message_id":"m-old","sender_id":"p1","sender_name":"Alice","is_broadcast":true,"body":"legacy","timestamp":12345}"#;
+        let frame = build_tcp_frame(&msg_key, FrameKind::ControlJson, legacy_json).unwrap();
+        let decoded = decode_tcp_control_frame(&msg_key, &frame).unwrap();
+        assert_eq!(
+            decoded,
+            TcpPayload::Chat {
+                message_id: "m-old".to_string(),
+                sender_id: "p1".to_string(),
+                sender_name: "Alice".to_string(),
+                is_broadcast: true,
+                body: "legacy".to_string(),
+                timestamp: 12345,
+                reply_to_id: None,
+                reply_to_sender: None,
+                reply_to_preview: None,
+            }
         );
     }
 }

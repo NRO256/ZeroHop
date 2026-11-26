@@ -15,7 +15,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use zerohop::app::coordinator::SessionLogReader;
 use zerohop::app::state::{AppEvent, AppStateKind, UiCommand};
-use zerohop::domain::model::{PeerView, ThreadKey, UserStatus};
+use zerohop::domain::model::{PeerView, ReplyReference, ThreadKey, UserStatus};
 use zerohop::network::nic::NicInfo;
 use zerohop::storage::config::LocalConfig;
 use zerohop::storage::paths::AppPaths;
@@ -48,7 +48,8 @@ pub(crate) struct UiHandles {
     pub main_thread_header: HWND,
     pub main_notice: HWND,
     pub main_chat_list: HWND,
-    pub main_byte_guide: HWND,
+    pub main_reply_label: HWND,
+    pub main_reply_clear_btn: HWND,
     pub main_input_edit: HWND,
     pub main_send_btn: HWND,
     pub main_file_btn: HWND,
@@ -82,14 +83,13 @@ impl UiHandles {
         ]
     }
 
-    pub fn main_controls(&self) -> [HWND; 10] {
+    pub fn main_controls(&self) -> [HWND; 9] {
         [
             self.main_peer_label,
             self.main_peer_list,
             self.main_thread_header,
             self.main_notice,
             self.main_chat_list,
-            self.main_byte_guide,
             self.main_input_edit,
             self.main_send_btn,
             self.main_file_btn,
@@ -109,7 +109,7 @@ impl UiHandles {
         ]
     }
 
-    pub fn all_ui_font_controls(&self) -> [HWND; 26] {
+    pub fn all_ui_font_controls(&self) -> [HWND; 27] {
         [
             self.login_subtitle,
             self.login_name_label,
@@ -126,7 +126,8 @@ impl UiHandles {
             self.main_peer_list,
             self.main_notice,
             self.main_chat_list,
-            self.main_byte_guide,
+            self.main_reply_label,
+            self.main_reply_clear_btn,
             self.main_input_edit,
             self.main_send_btn,
             self.main_file_btn,
@@ -192,6 +193,7 @@ pub(crate) struct UiState {
     pub auto_logout_sent: bool,
     pub pending_delivery_sync: bool,
     pub delivery_debounce_timer_active: bool,
+    pub pending_reply: Option<ReplyReference>,
 }
 
 impl UiState {
@@ -226,6 +228,7 @@ impl UiState {
         self.auto_logout_sent = false;
         self.pending_delivery_sync = false;
         self.delivery_debounce_timer_active = false;
+        self.pending_reply = None;
     }
 }
 

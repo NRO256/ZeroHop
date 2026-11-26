@@ -2,7 +2,9 @@ use std::collections::{HashMap, VecDeque};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::domain::model::{InMemoryChatMessage, MAX_MESSAGES_PER_THREAD, ThreadKey};
+use crate::domain::model::{
+    DELETED_MESSAGE_PLACEHOLDER, InMemoryChatMessage, MAX_MESSAGES_PER_THREAD, ThreadKey,
+};
 use crate::domain::validation::{ValidationError, validate_received_chat_body};
 
 #[derive(Debug)]
@@ -91,6 +93,13 @@ impl SessionLog {
             .get(thread)
             .and_then(|queue| queue.get(index))
             .map(|stored| &stored.message)
+    }
+
+    pub fn export_thread_messages(&self, thread: &ThreadKey) -> Vec<InMemoryChatMessage> {
+        self.threads
+            .get(thread)
+            .map(|queue| queue.iter().map(|stored| stored.message.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn push_message(
@@ -218,6 +227,35 @@ impl SessionLog {
         true
     }
 
+    pub fn mark_message_deleted(
+        &mut self,
+        thread: &ThreadKey,
+        message_id: &str,
+        expected_sender_id: &str,
+    ) -> bool {
+        let delta = {
+            let Some(queue) = self.threads.get_mut(thread) else {
+                return false;
+            };
+            let Some(stored) = queue
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.message.message_id == message_id)
+            else {
+                return false;
+            };
+            if stored.message.is_deleted || stored.message.sender_id != expected_sender_id {
+                return false;
+            }
+            stored.message.body.zeroize();
+            stored.message.body = DELETED_MESSAGE_PLACEHOLDER.to_string();
+            stored.message.is_deleted = true;
+            stored.message.recalculate_approx_bytes()
+        };
+        self.apply_byte_delta(delta);
+        true
+    }
+
     fn apply_byte_delta(&mut self, delta: isize) {
         if delta >= 0 {
             self.current_total_bytes = self.current_total_bytes.saturating_add(delta as usize);
@@ -305,6 +343,9 @@ impl SessionLog {
             Some(thread) => {
                 if let Some(queue) = self.threads.get(thread) {
                     for (idx, stored) in queue.iter().enumerate() {
+                        if stored.message.is_deleted {
+                            continue;
+                        }
                         if stored.message.body.to_lowercase().contains(&needle)
                             || stored.message.sender_name.to_lowercase().contains(&needle)
                         {
@@ -325,6 +366,9 @@ impl SessionLog {
             None => {
                 for (thread, queue) in &self.threads {
                     for (idx, stored) in queue.iter().enumerate() {
+                        if stored.message.is_deleted {
+                            continue;
+                        }
                         if stored.message.body.to_lowercase().contains(&needle)
                             || stored.message.sender_name.to_lowercase().contains(&needle)
                         {
@@ -532,5 +576,65 @@ mod tests {
         hit.zeroize();
         assert!(hit.sender_name.is_empty());
         assert!(hit.preview.is_empty());
+    }
+
+    #[test]
+    fn export_thread_messages_returns_ordered_snapshot_or_empty() {
+        let mut log = SessionLog::new(1024 * 1024);
+        assert!(log.export_thread_messages(&ThreadKey::Broadcast).is_empty());
+
+        log.push_message(ThreadKey::Broadcast, make_msg("1", "最初の投稿", 10))
+            .unwrap();
+        log.push_message(
+            ThreadKey::Peer("peer-a".into()),
+            make_msg("2", "個別投稿", 20),
+        )
+        .unwrap();
+        log.push_message(ThreadKey::Broadcast, make_msg("3", "2番目の投稿", 30))
+            .unwrap();
+
+        let broadcast = log.export_thread_messages(&ThreadKey::Broadcast);
+        assert_eq!(broadcast.len(), 2);
+        assert_eq!(broadcast[0].message_id, "1");
+        assert_eq!(broadcast[1].message_id, "3");
+
+        let peer = log.export_thread_messages(&ThreadKey::Peer("peer-a".into()));
+        assert_eq!(peer.len(), 1);
+        assert_eq!(peer[0].body, "個別投稿");
+    }
+
+    #[test]
+    fn mark_message_deleted_verifies_sender_zeroizes_body_and_excludes_from_search() {
+        let mut log = SessionLog::new(1024 * 1024);
+        let secret_msg = InMemoryChatMessage::new(
+            "m-secret",
+            "alice-id",
+            "Alice",
+            "極秘キーワードを含む長い本文".repeat(10),
+            100,
+            DeliveryState::DirectDelivered,
+        );
+        log.push_message(ThreadKey::Broadcast, secret_msg).unwrap();
+        let before_bytes = log.current_total_bytes();
+
+        // 送信者不一致は拒否される
+        assert!(!log.mark_message_deleted(&ThreadKey::Broadcast, "m-secret", "bob-id"));
+        assert!(
+            !log.get_message(&ThreadKey::Broadcast, 0)
+                .unwrap()
+                .is_deleted
+        );
+
+        // 送信者一致で削除成功し、プレースホルダ置換・バイト数減少・検索除外される
+        assert!(log.mark_message_deleted(&ThreadKey::Broadcast, "m-secret", "alice-id"));
+        let deleted = log.get_message(&ThreadKey::Broadcast, 0).unwrap();
+        assert!(deleted.is_deleted);
+        assert_eq!(deleted.body, DELETED_MESSAGE_PLACEHOLDER);
+        assert!(log.current_total_bytes() < before_bytes);
+        assert!(log.search(None, "極秘キーワード", 10).is_empty());
+        assert!(log.search(None, "削除されました", 10).is_empty());
+
+        // 二重削除は false
+        assert!(!log.mark_message_deleted(&ThreadKey::Broadcast, "m-secret", "alice-id"));
     }
 }

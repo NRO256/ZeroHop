@@ -17,6 +17,7 @@ pub const MAX_CHAT_BODY_BYTES: usize = 4096;
 pub const MAX_DISPLAY_NAME_CHARS: usize = 32;
 pub const MIN_PASSWORD_CHARS: usize = 8;
 pub const MAX_MESSAGES_PER_THREAD: usize = 1000;
+pub const DELETED_MESSAGE_PLACEHOLDER: &str = "メッセージは削除されました";
 pub const MAX_TRACKED_PEERS: usize = 64;
 pub const DEFAULT_MAX_TOTAL_LOG_BYTES: usize = 16 * 1024 * 1024;
 pub const MIN_MAX_MEMORY_MB: u16 = 4;
@@ -186,6 +187,23 @@ pub enum ThreadKey {
     Peer(String),
 }
 
+/// 返信元メッセージの軽量参照メタデータ
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct ReplyReference {
+    pub message_id: String,
+    pub sender_name: String,
+    pub preview: String,
+}
+
+impl ReplyReference {
+    pub fn approx_extra_bytes(&self) -> usize {
+        self.message_id
+            .len()
+            .saturating_add(self.sender_name.len())
+            .saturating_add(self.preview.len())
+    }
+}
+
 /// セッション限定インメモリ会話メッセージ（Core 単一保持）
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct InMemoryChatMessage {
@@ -195,6 +213,8 @@ pub struct InMemoryChatMessage {
     pub body: String,
     pub timestamp: i64,
     pub delivery: DeliveryState,
+    pub is_deleted: bool,
+    pub reply_to: Option<ReplyReference>,
     pub approx_bytes: usize,
 }
 
@@ -214,10 +234,18 @@ impl InMemoryChatMessage {
             body: body.into(),
             timestamp,
             delivery,
+            is_deleted: false,
+            reply_to: None,
             approx_bytes: 0,
         };
         msg.approx_bytes = msg.compute_approx_bytes();
         msg
+    }
+
+    pub fn with_reply_to(mut self, reply_to: Option<ReplyReference>) -> Self {
+        self.reply_to = reply_to;
+        self.approx_bytes = self.compute_approx_bytes();
+        self
     }
 
     pub fn compute_approx_bytes(&self) -> usize {
@@ -227,6 +255,11 @@ impl InMemoryChatMessage {
             .saturating_add(self.sender_name.len())
             .saturating_add(self.body.len())
             .saturating_add(self.delivery.approx_extra_bytes())
+            .saturating_add(
+                self.reply_to
+                    .as_ref()
+                    .map_or(0, ReplyReference::approx_extra_bytes),
+            )
     }
 
     pub fn recalculate_approx_bytes(&mut self) -> isize {

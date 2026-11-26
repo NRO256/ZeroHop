@@ -135,6 +135,7 @@ async fn screen_lock_retains_inbound_verifies_password_searches_and_allows_direc
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(bob_id.clone()),
             body: Zeroizing::new("should-not-send".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();
@@ -144,6 +145,7 @@ async fn screen_lock_retains_inbound_verifies_password_searches_and_allows_direc
         .send(UiCommand::SendChat {
             thread: ThreadKey::Peer(alice_id_on_bob.clone()),
             body: Zeroizing::new("Urgent Meeting Notice".to_string()),
+            reply_to: None,
         })
         .await
         .unwrap();

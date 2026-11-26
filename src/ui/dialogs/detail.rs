@@ -28,6 +28,7 @@ pub(crate) struct DetailDialogInput {
     pub body: String,
     #[zeroize(skip)]
     pub can_retry: bool,
+    pub reply_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +81,17 @@ pub(crate) fn show_message_detail_dialog(
     detail: &DetailDialogInput,
     dpi: u32,
 ) -> DetailDialogAction {
-    let meta = Zeroizing::new(format!(
-        "送信者: {}  |  時刻: {}  |  状態: {}",
-        detail.sender_name, detail.time_text, detail.status_text
-    ));
+    let meta = Zeroizing::new(match &detail.reply_summary {
+        Some(reply) => format!(
+            "送信者: {}  |  時刻: {}  |  状態: {}\r\n返信先: {}",
+            detail.sender_name, detail.time_text, detail.status_text, reply
+        ),
+        None => format!(
+            "送信者: {}  |  時刻: {}  |  状態: {}",
+            detail.sender_name, detail.time_text, detail.status_text
+        ),
+    });
+    let has_reply = detail.reply_summary.is_some();
     let body_crlf = Zeroizing::new(normalize_crlf(&detail.body));
     let body_clone = Zeroizing::new(detail.body.clone());
     let can_retry = detail.can_retry;
@@ -92,10 +100,14 @@ pub(crate) fn show_message_detail_dialog(
         parent,
         "メッセージ全文詳細 - ZeroHop",
         600,
-        410,
+        if has_reply { 430 } else { 410 },
         dpi,
         |dlg, hinst, ui_font, _| {
             let s = |v| scale_dpi(v, dpi);
+            let meta_h = if has_reply { s(40) } else { s(22) };
+            let edit_y = if has_reply { s(58) } else { s(40) };
+            let status_y = if has_reply { s(316) } else { s(298) };
+            let btn_y = if has_reply { s(344) } else { s(326) };
             let _meta_lbl = create_static(
                 dlg,
                 hinst,
@@ -105,7 +117,7 @@ pub(crate) fn show_message_detail_dialog(
                 s(16),
                 s(12),
                 s(552),
-                s(22),
+                meta_h,
             );
             let hwnd_edit = create_edit(
                 dlg,
@@ -119,7 +131,7 @@ pub(crate) fn show_message_detail_dialog(
                     | (ES_AUTOVSCROLL as u32)
                     | (ES_READONLY as u32),
                 s(16),
-                s(40),
+                edit_y,
                 s(552),
                 s(250),
             );
@@ -133,7 +145,7 @@ pub(crate) fn show_message_detail_dialog(
                 IDC_DLG_DETAIL_STATUS,
                 "Esc キーまたは「閉じる」で会話一覧の選択行へ戻ります。",
                 s(16),
-                s(298),
+                status_y,
                 s(552),
                 s(20),
             );
@@ -145,7 +157,7 @@ pub(crate) fn show_message_detail_dialog(
                 "本文をコピー(&C)",
                 false,
                 s(16),
-                s(326),
+                btn_y,
                 s(146),
                 s(30),
             );
@@ -157,7 +169,7 @@ pub(crate) fn show_message_detail_dialog(
                 "再送(&R)",
                 false,
                 s(174),
-                s(326),
+                btn_y,
                 s(104),
                 s(30),
             );

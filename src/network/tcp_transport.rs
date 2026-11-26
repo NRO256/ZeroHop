@@ -723,6 +723,9 @@ mod tests {
             is_broadcast: true,
             body: "セマフォ20並列送信テスト".to_string(),
             timestamp: 1_700_000_000,
+            reply_to_id: None,
+            reply_to_sender: None,
+            reply_to_preview: None,
         };
         let results = send_broadcast_control(targets, key, chat).await;
         assert_eq!(results.len(), 20);

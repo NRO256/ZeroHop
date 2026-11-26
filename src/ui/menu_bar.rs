@@ -11,9 +11,10 @@ use zerohop::storage::config::LocalConfig;
 
 use super::{
     IDM_ABOUT, IDM_ADD_MANUAL_PEER, IDM_CANCEL_FILE_TRANSFER, IDM_CLEAR_ALL, IDM_CLEAR_CURRENT,
-    IDM_CONN_INFO, IDM_EXIT, IDM_LOCK_SCREEN, IDM_LOGOUT, IDM_OPTIONS, IDM_REFRESH_NETWORK,
-    IDM_RETRY_SELECTED, IDM_SEARCH, IDM_SEND_FILE, IDM_SHORTCUTS, IDM_SHOW_DETAIL, IDM_STATUS_AWAY,
-    IDM_STATUS_BUSY, IDM_STATUS_ONLINE, IDM_TOGGLE_SEND_ON_ENTER, IDM_TOGGLE_SOUND, to_wide,
+    IDM_CONN_INFO, IDM_EXIT, IDM_EXPORT_CHAT_LOG, IDM_INSERT_MENTION, IDM_LOCK_SCREEN, IDM_LOGOUT,
+    IDM_OPTIONS, IDM_REFRESH_NETWORK, IDM_RETRY_SELECTED, IDM_SEARCH, IDM_SEND_FILE, IDM_SHORTCUTS,
+    IDM_SHOW_DETAIL, IDM_STATUS_AWAY, IDM_STATUS_BUSY, IDM_STATUS_ONLINE, IDM_TOGGLE_SEND_ON_ENTER,
+    IDM_TOGGLE_SOUND, to_wide,
 };
 
 pub(crate) struct MenuHandles {
@@ -69,6 +70,16 @@ pub(crate) fn create_main_menu_bar() -> MenuHandles {
             "選択メッセージの詳細を表示(&D)\tEnter",
         );
         append_str(edit, IDM_RETRY_SELECTED, "未達メッセージを再送(&R)");
+        append_str(
+            edit,
+            IDM_EXPORT_CHAT_LOG,
+            "現在の会話ログを保存(&S)...\tCtrl+S",
+        );
+        append_str(
+            edit,
+            IDM_INSERT_MENTION,
+            "メンションを挿入(&M)...\tCtrl+Shift+M",
+        );
         append_sep(edit);
         append_str(
             edit,
@@ -158,6 +169,8 @@ pub(crate) fn sync_menu_enabled_state(hmenu: HMENU, app_state: AppStateKind) {
         IDM_SEARCH,
         IDM_SHOW_DETAIL,
         IDM_RETRY_SELECTED,
+        IDM_EXPORT_CHAT_LOG,
+        IDM_INSERT_MENTION,
         IDM_CLEAR_CURRENT,
         IDM_CLEAR_ALL,
         IDM_ADD_MANUAL_PEER,

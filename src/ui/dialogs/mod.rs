@@ -508,6 +508,56 @@ pub(crate) fn confirm_logout_or_exit(parent: HWND, is_exit: bool, dpi: u32) -> b
     res.confirmed
 }
 
+pub(crate) fn confirm_delete_message(parent: HWND, dpi: u32) -> bool {
+    let res = run_modal_dialog(
+        parent,
+        "メッセージの削除確認 - ZeroHop",
+        440,
+        165,
+        dpi,
+        |dlg, hinst, ui_font, _| {
+            let s = |v| scale_dpi(v, dpi);
+            let _lbl = create_static(
+                dlg,
+                hinst,
+                ui_font,
+                0,
+                "このメッセージを削除しますか？\r\n自分の画面と通信相手の画面で「メッセージは削除されました」に置き換わります。",
+                s(16),
+                s(16),
+                s(394),
+                s(52),
+            );
+            let _btn_ok = create_button(
+                dlg,
+                hinst,
+                ui_font,
+                IDOK as usize,
+                "削除する(&D)",
+                false,
+                s(154),
+                s(80),
+                s(132),
+                s(30),
+            );
+            let btn_cancel = create_button(
+                dlg,
+                hinst,
+                ui_font,
+                IDCANCEL as usize,
+                "キャンセル(&N)",
+                true,
+                s(296),
+                s(80),
+                s(114),
+                s(30),
+            );
+            (ConfirmHandler { confirmed: false }, btn_cancel)
+        },
+    );
+    res.confirmed
+}
+
 // 2. 情報表示用モーダル共通（通信情報・ショートカット一覧・バージョン情報）
 struct ReadOnlyInfoHandler {
     text: String,
@@ -650,6 +700,8 @@ pub(crate) fn show_shortcuts_dialog(parent: HWND, dpi: u32) {
   Alt + A / E / T / H  : メニューバー各項目を開く\n\
   F6 / Shift+F6        : 接続先リスト / 会話一覧 / メッセージ入力欄を巡回移動\n\
   Ctrl + F             : セッション内メッセージ検索\n\
+  Ctrl + S             : 現在の会話ログをテキストファイル (.txt) へ保存\n\
+  Ctrl + Shift + M     : オンライン相手を選択して @表示名 メンションを挿入\n\
   Ctrl + L             : ワンキー画面ロック（会話・ピア一覧を即時遮蔽）\n\
   Ctrl + M             : 手動ピア追加（IP・ポート指定接続）\n\
   F5                   : ネットワーク再検出（NIC・ソケット再確認）\n\
@@ -664,9 +716,11 @@ pub(crate) fn show_shortcuts_dialog(parent: HWND, dpi: u32) {
 [会話一覧・入力欄]\n\
   上下矢印キー         : 会話メッセージ行または接続先を選択\n\
   Enter（会話一覧上）  : 選択メッセージの全文詳細ダイアログを開く（コピー・再送可）\n\
+  Shift+F10 / Apps / 右クリック : 会話一覧・接続先一覧のコンテキストメニューを開く\n\
   Esc（詳細画面上）    : 詳細ダイアログを閉じて直前選択行へフォーカス復帰\n\
-  Ctrl + Enter（入力欄）: 既定設定時のメッセージ送信（Enter のみは改行）\n\
-  Enter（入力欄）      : 「Enterキーで送信」有効時の送信（Shift+Enter で改行、IME変換中は非送信）\n\
+  Esc（入力欄・返信中）: 返信先指定を解除\n\
+  Enter（入力欄）      : 既定設定時のメッセージ送信（Shift+Enter で改行、IME変換中は非送信）\n\
+  Ctrl + Enter（入力欄）: 「Enterキーで送信」無効時の送信（Enter のみは改行）\n\
   Ctrl + A（入力欄）   : 入力テキストを全選択";
     show_readonly_info_modal(
         parent,
@@ -736,25 +790,56 @@ pub(crate) fn pick_open_file_dialog(owner: HWND) -> Option<PathBuf> {
     (ok != 0).then(|| extract_ofn_path(&file_buf)).flatten()
 }
 
-pub(crate) fn pick_save_file_dialog(owner: HWND, default_filename: &str) -> Option<PathBuf> {
+fn pick_save_dialog_with_filter(
+    owner: HWND,
+    default_filename: &str,
+    title: &str,
+    filter_utf16: &[u16],
+    def_ext_utf16: Option<&[u16]>,
+) -> Option<PathBuf> {
     let mut file_buf = vec![0u16; 4096];
     let default_units: Vec<u16> = default_filename.encode_utf16().take(255).collect();
     file_buf[..default_units.len()].copy_from_slice(&default_units);
 
-    let filter: Vec<u16> = "すべてのファイル (*.*)\0*.*\0\0".encode_utf16().collect();
-    let title = to_wide("受信ファイルの保存先を指定");
+    let title_w = to_wide(title);
 
     let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
     ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
     ofn.hwndOwner = owner;
-    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFilter = filter_utf16.as_ptr();
     ofn.lpstrFile = file_buf.as_mut_ptr();
     ofn.nMaxFile = file_buf.len() as u32;
-    ofn.lpstrTitle = title.as_ptr();
+    ofn.lpstrTitle = title_w.as_ptr();
+    ofn.lpstrDefExt = def_ext_utf16.map_or(std::ptr::null(), <[u16]>::as_ptr);
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     let ok = unsafe { GetSaveFileNameW(&mut ofn) };
     (ok != 0).then(|| extract_ofn_path(&file_buf)).flatten()
+}
+
+pub(crate) fn pick_save_file_dialog(owner: HWND, default_filename: &str) -> Option<PathBuf> {
+    let filter: Vec<u16> = "すべてのファイル (*.*)\0*.*\0\0".encode_utf16().collect();
+    pick_save_dialog_with_filter(
+        owner,
+        default_filename,
+        "受信ファイルの保存先を指定",
+        &filter,
+        None,
+    )
+}
+
+pub(crate) fn pick_save_text_log_dialog(owner: HWND, default_filename: &str) -> Option<PathBuf> {
+    let filter: Vec<u16> = "テキストファイル (*.txt)\0*.txt\0すべてのファイル (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let def_ext = to_wide("txt");
+    pick_save_dialog_with_filter(
+        owner,
+        default_filename,
+        "会話ログをテキストファイルとして保存",
+        &filter,
+        Some(&def_ext),
+    )
 }
 
 pub(crate) fn confirm_file_offer_dialog(

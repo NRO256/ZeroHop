@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-use crate::domain::model::{PeerView, ThreadKey, UserStatus};
+use crate::domain::model::{PeerView, ReplyReference, ThreadKey, UserStatus};
 use crate::network::nic::NicInfo;
 use crate::storage::config::LocalConfig;
 
@@ -54,8 +54,13 @@ pub enum UiCommand {
     SendChat {
         thread: ThreadKey,
         body: Zeroizing<String>,
+        reply_to: Option<ReplyReference>,
     },
     RetryChat {
+        thread: ThreadKey,
+        message_id: String,
+    },
+    DeleteMessage {
         thread: ThreadKey,
         message_id: String,
     },
@@ -98,13 +103,23 @@ impl fmt::Debug for UiCommand {
                 .field("password", &"[REDACTED]")
                 .finish(),
             Self::CancelLogin => f.write_str("CancelLogin"),
-            Self::SendChat { thread, body } => f
+            Self::SendChat {
+                thread,
+                body,
+                reply_to,
+            } => f
                 .debug_struct("SendChat")
                 .field("thread", thread)
                 .field("body_len", &body.len())
+                .field("has_reply", &reply_to.is_some())
                 .finish(),
             Self::RetryChat { thread, message_id } => f
                 .debug_struct("RetryChat")
+                .field("thread", thread)
+                .field("message_id", message_id)
+                .finish(),
+            Self::DeleteMessage { thread, message_id } => f
+                .debug_struct("DeleteMessage")
                 .field("thread", thread)
                 .field("message_id", message_id)
                 .finish(),
@@ -180,6 +195,7 @@ pub enum AppEvent {
         thread: ThreadKey,
         sender_name: String,
         preview: String,
+        is_mentioned: bool,
     },
     ScreenLocked,
     ScreenUnlockResult {

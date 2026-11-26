@@ -44,7 +44,7 @@ impl Default for LocalConfig {
             sound_on_login_logout: true,
             sound_on_peer_presence: true,
             sound_on_message: true,
-            send_on_enter: false,
+            send_on_enter: true,
             hide_notification_preview: false,
             auto_away_minutes: 5,
             uia_announce_incoming: true,
@@ -285,8 +285,14 @@ mod tests {
                 assert_eq!(cfg.max_memory_mb, MAX_MAX_MEMORY_MB);
                 assert_eq!(cfg.preferred_nic_ip, None);
                 assert!(cfg.sound_enabled);
-                assert!(!cfg.send_on_enter);
+                assert!(cfg.send_on_enter);
             }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        std::fs::write(paths.config_path(), r#"{"send_on_enter": false}"#).unwrap();
+        match load_config(&paths) {
+            ConfigLoadResult::Loaded(cfg) => assert!(!cfg.send_on_enter),
             other => panic!("unexpected result: {other:?}"),
         }
 
